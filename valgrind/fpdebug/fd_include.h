@@ -59,6 +59,16 @@ typedef
    }
    OrgType;
 
+typedef
+	enum {
+		Rt_I16S,
+		Rt_I32S,
+		Rt_I64S,
+		Rt_I32U,
+		Rt_I64U
+	}
+	RetType;
+
 /*
 	Node with per-allocation information that will be stored in a hash map.
 	As specified in <pub_tool_hashtable.h>, the first member must be a pointer
@@ -190,7 +200,6 @@ typedef
 
 		Float	orgFloat;
 		Double 	orgDouble;
-		Int 	orgInt;
 	} BinOp;
 
 typedef

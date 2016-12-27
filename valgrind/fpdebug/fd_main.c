@@ -115,6 +115,7 @@ static Bool    		clo_error_localization  = False;
 static Bool  		clo_print_every_error   = False;
 static Bool         clo_detect_pso			= False;
 static Bool 		clo_goto_shadow_branch	= False;
+static Bool 		clo_track_int			= False;
 
 static UInt activeStages 					= 0;
 static ULong sbExecuted 					= 0;
@@ -146,6 +147,7 @@ static Bool fd_process_cmd_line_option(Char* arg) {
     else if VG_BOOL_CLO(arg, "--print-every-error", clo_print_every_error) {}
     else if VG_BOOL_CLO(arg, "--detect-pso", clo_detect_pso) {}
     else if VG_BOOL_CLO(arg, "--goto-shadow-branch", clo_goto_shadow_branch) {}
+    else if VG_BOOL_CLO(arg, "--track-int", clo_track_int) {}
 	else 
 		return False;
    
@@ -165,6 +167,7 @@ static void fd_print_usage(void) {
 "    --print-every-error=no|yes  print the error of every statement [no]\n"
 "    --detect-pso=no|yes	   detect and fix precision-specific operations [no]\n"
 "    --goto-shadow-branch=no|yes choose branch according to shadow vlaue (high-precision) [no]\n"
+"    --track-int=no|yes		   continue track the shadow value for integers [no]\n"
 	);
 }
 
@@ -1157,6 +1160,11 @@ static Bool isOpFloat(IROp op) {
 		case Iop_Min64F0x2:
 		case Iop_Max64F0x2:
 		case Iop_CmpF64:
+		case Iop_F64toI16S:
+		case Iop_F64toI32S:
+		case Iop_F64toI64S:
+		case Iop_F64toI64U:
+		case Iop_F64toI32U:
 		/* ternary double */
 		case Iop_AddF64:
 		case Iop_SubF64:
@@ -2314,6 +2322,180 @@ static void instrumentCmpF64(IRSB* sb, IRTypeEnv* env, Addr addr, IRTemp wrTemp,
 	addStmtToIRSB(sb, IRStmt_Dirty(di));
 }
 
+static Double processCvtOpKernel(Addr addr, UWord ca) {
+	Int constArgs = (Int)ca;
+
+	if (clo_simulateOriginal) {
+		if (isOpFloat(binOpArgs->op)) {
+			mpfr_set_prec(arg2tmpX, 24);
+		} else {
+			mpfr_set_prec(arg2tmpX, 53);
+		}
+	}
+
+	if (isOpFloat(binOpArgs->op)) {
+		mpfr_set_prec(arg2midX, 24);
+		mpfr_set_prec(arg2oriX, 24);
+	} else {
+		mpfr_set_prec(arg2midX, 53);
+		mpfr_set_prec(arg2oriX, 53);
+	}
+
+	ULong arg2opCount = 0;
+	Addr arg2origin = 0;
+	mpfr_exp_t arg2canceled = 0;
+	mpfr_exp_t canceled = 0;
+	Addr arg2CancelOrigin = 0;
+	mpfr_t irel2;
+	mpfr_inits(irel2, NULL);
+
+	Int exactBitsArg1, exactBitsArg2;
+	if (isOpFloat(binOpArgs->op)) {
+		exactBitsArg2 = 23;
+	} else {
+		exactBitsArg2 = 52;
+	}
+
+	if (constArgs & 0x2) {
+		readSConst(1, &(arg2tmpX));
+		mpfr_set(arg2midX, arg2tmpX, STD_RND);
+		beginEmulateDouble();
+		int t = mpfr_set(arg2oriX, arg2tmpX, STD_RND);
+		mpfr_subnormalize(arg2oriX, t, STD_RND);
+		endEmulate();
+	} else {
+		ShadowValue* arg2tmp = getTemp(binOpArgs->arg2);
+		checkAndRecover(arg2tmp);
+		computeRelativeError(arg2tmp, irel2);
+		if (arg2tmp) {
+			mpfr_set(arg2tmpX, arg2tmp->value, STD_RND);
+			mpfr_set(arg2midX, arg2tmp->midValue, STD_RND);
+			beginEmulateDouble();
+			int t = mpfr_set(arg2oriX, arg2tmp->oriValue, STD_RND);
+			mpfr_subnormalize(arg2oriX, t, STD_RND);
+			endEmulate();
+			arg2opCount = arg2tmp->opCount;
+			arg2origin = arg2tmp->origin;
+			arg2canceled = arg2tmp->canceled;
+			arg2CancelOrigin = arg2tmp->cancelOrigin;
+
+			if (clo_bad_cancellations) {
+				readSTemp(1, &cancelTemp);
+				if (mpfr_get_exp(cancelTemp) == mpfr_get_exp(arg2tmpX)) {
+					mpfr_sub(cancelTemp, arg2tmpX, cancelTemp, STD_RND);
+					if (mpfr_cmp_ui(cancelTemp, 0) != 0) {
+						exactBitsArg2 = abs(mpfr_get_exp(arg2tmpX) - mpfr_get_exp(cancelTemp)) - 2;
+						if (arg2tmp->orgType == Ot_FLOAT && exactBitsArg2 > 23) {
+							exactBitsArg2 = 23;
+						} else if (arg2tmp->orgType == Ot_DOUBLE && exactBitsArg2 > 52) {
+							exactBitsArg2 = 52;
+						}
+					}
+				} else {
+					exactBitsArg2 = 0;
+				}
+			}
+		} else {
+			readSTemp(1, &(arg2tmpX));
+			mpfr_set(arg2midX, arg2tmpX, STD_RND);
+			beginEmulateDouble();
+			int t = mpfr_set(arg2oriX, arg2tmpX, STD_RND);
+			mpfr_subnormalize(arg2oriX, t, STD_RND);
+			endEmulate();
+		}
+	}
+
+	return mpfr_get_d(arg2tmpX, STD_RND);
+}
+
+static VG_REGPARM(2) UInt processCvtI32U(Addr addr, UWord ca) {
+	if (!clo_analyze) return;
+	Double shadow_double = processCvtOpKernel(addr, ca);
+	return shadow_double;
+}
+
+static VG_REGPARM(2) Int processCvtI32S(Addr addr, UWord ca) {
+	if (!clo_analyze) return;
+	Double shadow_double = processCvtOpKernel(addr, ca);
+	return shadow_double;
+}
+
+static VG_REGPARM(2) ULong processCvtI64U(Addr addr, UWord ca) {
+	if (!clo_analyze) return;
+	Double shadow_double = processCvtOpKernel(addr, ca);
+	return shadow_double;
+}
+
+static VG_REGPARM(2) Long processCvtI64S(Addr addr, UWord ca) {
+	if (!clo_analyze) return;
+	Double shadow_double = processCvtOpKernel(addr, ca);
+	return shadow_double;
+}
+
+static VG_REGPARM(2) Short processCvtI16S(Addr addr, UWord ca) {
+	if (!clo_analyze) return;
+	Double shadow_double = processCvtOpKernel(addr, ca);
+	return shadow_double;
+}
+
+static void instrumentCvtOp (IRSB* sb, IRTypeEnv* env, Addr addr, IRTemp wrTemp, IRExpr* binop, Int arg2tmpInstead, RetType retType) {
+	tl_assert(binop->tag == Iex_Binop);
+
+	if (clo_ignoreLibraries && isInLibrary(addr)) {
+		return;
+	}
+
+	IROp op = binop->Iex.Binop.op;
+	IRExpr* arg2 = binop->Iex.Binop.arg2;
+
+	tl_assert(arg2->tag == Iex_RdTmp || arg2->tag == Iex_Const);
+
+	Int constArgs = 0;
+
+	IRStmt* store = IRStmt_Store(Iend_LE, mkU64(&(binOpArgs->op)), mkU32(op));
+	addStmtToIRSB(sb, store);
+
+	if (arg2->tag == Iex_RdTmp) {
+		if (arg2tmpInstead >= 0) {
+			store = IRStmt_Store(Iend_LE, mkU64(&(binOpArgs->arg2)), mkU32(arg2tmpInstead));
+		} else {
+			store = IRStmt_Store(Iend_LE, mkU64(&(binOpArgs->arg2)), mkU32(arg2->Iex.RdTmp.tmp));
+		}
+		addStmtToIRSB(sb, store);
+
+		writeSTemp(sb, env, arg2->Iex.RdTmp.tmp, 1);
+	} else {
+		tl_assert(arg2->tag == Iex_Const);
+
+		writeSConst(sb, arg2->Iex.Const.con, 1);
+		constArgs |= 0x2;
+	}
+
+	IRExpr** argv = mkIRExprVec_2(mkU64(addr), mkU64(constArgs));
+	IRDirty* di;
+	switch(retType) {
+		case Rt_I16S:
+			di = unsafeIRDirty_1_N(wrTemp, 2, "processCvtI16S", VG_(fnptr_to_fnentry)(&processCvtI16S), argv);
+			break;
+		case Rt_I32S:
+			di = unsafeIRDirty_1_N(wrTemp, 2, "processCvtI32S", VG_(fnptr_to_fnentry)(&processCvtI32S), argv);
+			break;
+		case Rt_I64S:
+			di = unsafeIRDirty_1_N(wrTemp, 2, "processCvtI64S", VG_(fnptr_to_fnentry)(&processCvtI64S), argv);
+			break;
+		case Rt_I32U:
+			di = unsafeIRDirty_1_N(wrTemp, 2, "processCvtI32U", VG_(fnptr_to_fnentry)(&processCvtI32U), argv);
+			break;
+		case Rt_I64U:
+			di = unsafeIRDirty_1_N(wrTemp, 2, "processCvtI64U", VG_(fnptr_to_fnentry)(&processCvtI64U), argv);
+			break;
+		default:
+			VG_(tool_panic)("Should not reach here\n");
+	}
+	
+	addStmtToIRSB(sb, IRStmt_Dirty(di));
+}
+
 static VG_REGPARM(1) void processMux0X(UWord ca) {
 	// VG_(umsg)("processMux0X\n");
 	if (!clo_analyze) return;
@@ -2868,6 +3050,11 @@ static IRSB* fd_instrument(VgCallbackClosure* closure, IRSB* sbIn,
 								if (expr->Iex.Binop.arg1->tag == Iex_RdTmp) {
 									impTmp[expr->Iex.Binop.arg1->Iex.RdTmp.tmp] = 1;
 								}
+							case Iop_F64toI16S:
+							case Iop_F64toI32S:
+							case Iop_F64toI64S:
+							case Iop_F64toI64U:
+							case Iop_F64toI32U:
 								if (expr->Iex.Binop.arg2->tag == Iex_RdTmp) {
 									impTmp[expr->Iex.Binop.arg2->Iex.RdTmp.tmp] = 1;
 								}
@@ -3028,6 +3215,7 @@ static IRSB* fd_instrument(VgCallbackClosure* closure, IRSB* sbIn,
 
 	Int arg1tmpInstead = -1;
 	Int arg2tmpInstead = -1;
+	RetType retType;
 
 	/* This is the main loop which hads instructions for the analysis (instrumentation).*/
 	for (/*use current i*/; i < sbIn->stmts_used; i++) {
@@ -3100,6 +3288,8 @@ static IRSB* fd_instrument(VgCallbackClosure* closure, IRSB* sbIn,
 						}
 						break;
 					case Iex_Unop:
+						// opToStr(expr->Iex.Unop.op);
+						// VG_(umsg)("una : %s\n", opStr);
 						switch (expr->Iex.Unop.op) {
 							case Iop_Sqrt32F0x4:
 							case Iop_Sqrt64F0x2:
@@ -3160,6 +3350,8 @@ static IRSB* fd_instrument(VgCallbackClosure* closure, IRSB* sbIn,
 						}
 						break;
 					case Iex_Binop:
+						// opToStr(expr->Iex.Binop.op);
+						// VG_(umsg)("bin : %s\n", opStr);
 						switch (expr->Iex.Binop.op) {
 							case Iop_CmpF64:
 								if (clo_goto_shadow_branch) {
@@ -3171,7 +3363,7 @@ static IRSB* fd_instrument(VgCallbackClosure* closure, IRSB* sbIn,
 									if (expr->Iex.Binop.arg2->tag == Iex_RdTmp) {
 										arg2tmpInstead = tmpInstead[expr->Iex.Binop.arg2->Iex.RdTmp.tmp];
 									}
-									instrumentCmpF64(sbOut, sbOut->tyenv, cia, st->Ist.WrTmp.tmp, expr, arg1tmpInstead, arg2tmpInstead);
+									instrumentCmpF64(sbOut, tyenv, cia, st->Ist.WrTmp.tmp, expr, arg1tmpInstead, arg2tmpInstead);
 								} else {
 									addStmtToIRSB(sbOut, st);
 								}
@@ -3205,6 +3397,40 @@ static IRSB* fd_instrument(VgCallbackClosure* closure, IRSB* sbIn,
 							case Iop_32HLto64:
 								/* ignored floating-point and related SSE operations */
 								addStmtToIRSB(sbOut, st);
+								break;
+							case Iop_F64toI16S:
+							case Iop_F64toI32S:
+							case Iop_F64toI64S:
+							case Iop_F64toI64U:
+							case Iop_F64toI32U:
+								if (clo_track_int) {
+									arg2tmpInstead = -1;
+									if (expr->Iex.Binop.arg2->tag == Iex_RdTmp) {
+										arg2tmpInstead = tmpInstead[expr->Iex.Binop.arg2->Iex.RdTmp.tmp];
+									}
+									switch(expr->Iex.Binop.op) {
+										case Iop_F64toI16S:
+											retType = Rt_I16S;
+											break;
+										case Iop_F64toI32S:
+											retType = Rt_I32S;
+											break;
+										case Iop_F64toI64S:
+											retType = Rt_I64S;
+											break;
+										case Iop_F64toI64U:
+											retType = Rt_I64U;
+											break;
+										case Iop_F64toI32U:
+											retType = Rt_I32U;
+											break;
+										default:
+											VG_(tool_panic)("Should not reach here\n");
+									}
+									instrumentCvtOp(sbOut, tyenv, cia, st->Ist.WrTmp.tmp, expr, arg2tmpInstead, retType);
+								} else {
+									addStmtToIRSB(sbOut, st);
+								}
 								break;
 							case Iop_Add32Fx4:
 							case Iop_Sub32Fx4:
@@ -3245,6 +3471,8 @@ static IRSB* fd_instrument(VgCallbackClosure* closure, IRSB* sbIn,
 						}
 						break;
 					case Iex_Triop:
+						// opToStr(expr->Iex.Triop.op);
+						// VG_(umsg)("tri : %s\n", opStr);
 						switch (expr->Iex.Triop.op) {
 							case Iop_AddF64:
 							case Iop_SubF64:
@@ -4687,6 +4915,7 @@ static void fd_post_clo_init(void) {
     VG_(umsg)("print-every-error=%s\n", clo_print_every_error ? "yes" : "no");
     VG_(umsg)("detect-pso=%s\n", clo_detect_pso ? "yes" : "no");
     VG_(umsg)("goto-shadow-branch=%s\n", clo_goto_shadow_branch ? "yes" : "no");
+    VG_(umsg)("track-int=%s\n", clo_track_int ? "yes" : "no");
 
 	mpfr_set_default_prec(clo_precision);
 	defaultEmin = mpfr_get_emin();
