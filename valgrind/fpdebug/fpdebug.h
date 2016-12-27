@@ -69,19 +69,33 @@
 #include "../include/valgrind.h"
 
 typedef
-	enum {
-		VG_USERREQ__PRINT_ERROR,
-		VG_USERREQ__COND_PRINT_ERROR,
-		VG_USERREQ__DUMP_ERROR_GRAPH,
-		VG_USERREQ__COND_DUMP_ERROR_GRAPH,
-		VG_USERREQ__BEGIN_STAGE,
-		VG_USERREQ__END_STAGE,
-		VG_USERREQ__CLEAR_STAGE,
-		VG_USERREQ__ERROR_GREATER,
-		VG_USERREQ__RESET,
-		VG_USERREQ__INSERT_SHADOW,
-		VG_USERREQ__BEGIN,
-		VG_USERREQ__END
+  enum {
+    VG_USERREQ__PRINT_ERROR,
+    VG_USERREQ__COND_PRINT_ERROR,
+    VG_USERREQ__DUMP_ERROR_GRAPH,
+    VG_USERREQ__COND_DUMP_ERROR_GRAPH,
+    VG_USERREQ__BEGIN_STAGE,
+    VG_USERREQ__END_STAGE,
+    VG_USERREQ__CLEAR_STAGE,
+    VG_USERREQ__ERROR_GREATER,
+    VG_USERREQ__RESET,
+    VG_USERREQ__INSERT_SHADOW,
+    /**********************/
+    VG_USERREQ__SET_SHADOW,
+    VG_USERREQ__SHADOW_TO_ORIGINAL,
+    VG_USERREQ__ORIGINAL_TO_SHADOW,
+    VG_USERREQ__SET_ORIGINAL,
+    VG_USERREQ__SET_SHADOW_BY,
+    VG_USERREQ__GET_RELATIVE_ERROR,
+    VG_USERREQ__PSO_BEGIN_RUN,
+    VG_USERREQ__PSO_END_RUN,
+    VG_USERREQ__PSO_BEGIN_INSTANCE,
+    VG_USERREQ__IS_PSO_FINISHED,
+    VG_USERREQ__GET_SHADOW,
+    VG_USERREQ__PRINT_VALUES,
+    /**********************/
+    VG_USERREQ__BEGIN,
+    VG_USERREQ__END
    } Vg_FpDebugClientRequest;
 
 
@@ -164,7 +178,103 @@ typedef
                             _qzz_fp, 0, 0, 0, 0);       \
     _qzz_res;                                                    \
    }))
+/****************************/
+#define VALGRIND_SET_SHADOW(_qzz_fp)           \
+   (__extension__({unsigned long _qzz_res;                       \
+    VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0 /* default return */, \
+                            VG_USERREQ__SET_SHADOW,       \
+                            _qzz_fp, 0, 0, 0, 0);       \
+    _qzz_res;                                                    \
+   }))
 
+#define VALGRIND_SHADOW_TO_ORIGINAL(_qzz_fp)           \
+   (__extension__({unsigned long _qzz_res;                       \
+    VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0 /* default return */, \
+                            VG_USERREQ__SHADOW_TO_ORIGINAL,       \
+                            _qzz_fp, 0, 0, 0, 0);       \
+    _qzz_res;                                                    \
+   }))
+
+#define VALGRIND_ORIGINAL_TO_SHADOW(_qzz_fp)           \
+   (__extension__({unsigned long _qzz_res;                       \
+    VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0 /* default return */, \
+                            VG_USERREQ__ORIGINAL_TO_SHADOW,       \
+                            _qzz_fp, 0, 0, 0, 0);       \
+    _qzz_res;                                                    \
+   }))
+
+#define VALGRIND_SET_ORIGINAL(_qzz_fp, _qzz_num)           \
+   (__extension__({unsigned long _qzz_res;                       \
+    VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0 /* default return */, \
+                            VG_USERREQ__SET_ORIGINAL,       \
+                            _qzz_fp, _qzz_num, 0, 0, 0);       \
+    _qzz_res;                                                    \
+   }))
+
+#define VALGRIND_SET_SHADOW_BY(_qzz_fp, _qzz_num)           \
+   (__extension__({unsigned long _qzz_res;                       \
+    VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0 /* default return */, \
+                            VG_USERREQ__SET_SHADOW_BY,       \
+                            _qzz_fp, _qzz_num, 0, 0, 0);       \
+    _qzz_res;                                                    \
+   }))
+
+#define VALGRIND_GET_RELATIVE_ERROR(_qzz_fp, _qzz_rel)           \
+   (__extension__({unsigned long _qzz_res;                       \
+    VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0 /* default return */, \
+                            VG_USERREQ__GET_RELATIVE_ERROR,       \
+                            _qzz_fp, _qzz_rel, 0, 0, 0);       \
+    _qzz_res;                                                    \
+   }))
+
+#define VALGRIND_PSO_BEGIN_RUN()           \
+   (__extension__({unsigned long _qzz_res;                       \
+    VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0 /* default return */, \
+                            VG_USERREQ__PSO_BEGIN_RUN,       \
+                            0, 0, 0, 0, 0);       \
+    _qzz_res;                                                    \
+   }))
+
+#define VALGRIND_PSO_END_RUN()           \
+   (__extension__({unsigned long _qzz_res;                       \
+    VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0 /* default return */, \
+                            VG_USERREQ__PSO_END_RUN,       \
+                            0, 0, 0, 0, 0);       \
+    _qzz_res;                                                    \
+   }))
+
+#define VALGRIND_PSO_BEGIN_INSTANCE()           \
+   (__extension__({unsigned long _qzz_res;                       \
+    VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0 /* default return */, \
+                            VG_USERREQ__PSO_BEGIN_INSTANCE,      \
+                            0, 0, 0, 0, 0);       \
+    _qzz_res;                                                    \
+   }))
+
+#define VALGRIND_IS_PSO_FINISHED()           \
+   (__extension__({unsigned long _qzz_res;                       \
+    VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0 /* default return */, \
+                            VG_USERREQ__IS_PSO_FINISHED,      \
+                            0, 0, 0, 0, 0);       \
+    _qzz_res;                                                    \
+   }))
+
+#define VALGRIND_GET_SHADOW(_qzz_fp, _qzz_num)           \
+   (__extension__({unsigned long _qzz_res;                       \
+    VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0 /* default return */, \
+                            VG_USERREQ__GET_SHADOW,      \
+                            _qzz_fp, _qzz_num, 0, 0, 0);       \
+    _qzz_res;                                                    \
+   }))
+
+#define VALGRIND_PRINT_VALUES(_qzz_str, _qzz_num, _qzz_fp)           \
+   (__extension__({unsigned long _qzz_res;                       \
+    VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0 /* default return */, \
+                            VG_USERREQ__PRINT_VALUES,      \
+                            _qzz_str, _qzz_num, _qzz_fp, 0, 0);       \
+    _qzz_res;                                                    \
+   }))
+/****************************/
 #define VALGRIND_BEGIN()           \
    (__extension__({unsigned long _qzz_res;                       \
     VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0 /* default return */, \

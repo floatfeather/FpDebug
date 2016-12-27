@@ -84,6 +84,10 @@ typedef struct _ShadowValue {
 		} Org;
 
 		mpfr_t				value;
+
+		mpfr_t 				midValue;
+
+		mpfr_t 				oriValue;
 	} ShadowValue;
 
 typedef struct _MeanValue {
@@ -186,6 +190,7 @@ typedef
 
 		Float	orgFloat;
 		Double 	orgDouble;
+		Int 	orgInt;
 	} BinOp;
 
 typedef
@@ -227,6 +232,20 @@ typedef
          	UShort V128;
 		} Val;
 	} ShadowConst;
+
+typedef struct _ErrorCount {
+	struct _ErrorCount* next;
+		UWord			key;
+		int 			errCnt;
+		int 			ovCnt;
+		int 			totalCnt;
+	} ErrorCount;
+
+typedef struct _PSOperation {
+	struct _PSOperation* next;
+		UWord			key;
+		Bool 			falsePositive;
+	} PSOperation;
 
 #endif /* ndef __FD_INCLUDE_H */
 

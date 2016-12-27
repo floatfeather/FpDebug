@@ -69,7 +69,7 @@
 
 #include "opToString.c"
 
-
+#define mkU1(_n)							IRExpr_Const(IRConst_U1(_n))
 #define mkU32(_n)                			IRExpr_Const(IRConst_U32(_n))
 #define mkU64(_n)                			IRExpr_Const(IRConst_U64(_n))
 
@@ -92,6 +92,13 @@
 #define FWRITE_BUFSIZE 						32000
 #define FWRITE_THROUGH 						10000
 
+#define PSO_SIZE							10000
+#define PSO_INFLATION_THRESHOLD				(1.0e6)
+#define PSO_OV_ZERO_BOUND					(1e-9)
+#define PSO_SV_ZERO_BOUND					(1e-15)
+#define PSO_PERCENTIGE_THRESHOLD			(0.7)
+#define PSO_FALSEPOSITIVE_PERCENTAGE		(0.1)
+
 /* standard rounding mode: round to nearest */
 static mpfr_rnd_t 	STD_RND 				= MPFR_RNDN;
 
@@ -104,6 +111,10 @@ static Bool			clo_simulateOriginal	= False;
 static Bool			clo_analyze				= True;
 static Bool			clo_bad_cancellations	= True;
 static Bool			clo_ignore_end			= False;
+static Bool    		clo_error_localization  = False;
+static Bool  		clo_print_every_error   = False;
+static Bool         clo_detect_pso			= False;
+static Bool 		clo_goto_shadow_branch	= False;
 
 static UInt activeStages 					= 0;
 static ULong sbExecuted 					= 0;
@@ -131,6 +142,10 @@ static Bool fd_process_cmd_line_option(Char* arg) {
 	else if VG_BOOL_CLO(arg, "--sim-original", clo_simulateOriginal) {}
 	else if VG_BOOL_CLO(arg, "--analyze-all", clo_analyze) {}
     else if VG_BOOL_CLO(arg, "--ignore-end", clo_ignore_end) {}
+    else if VG_BOOL_CLO(arg, "--error-localization", clo_error_localization) {}
+    else if VG_BOOL_CLO(arg, "--print-every-error", clo_print_every_error) {}
+    else if VG_BOOL_CLO(arg, "--detect-pso", clo_detect_pso) {}
+    else if VG_BOOL_CLO(arg, "--goto-shadow-branch", clo_goto_shadow_branch) {}
 	else 
 		return False;
    
@@ -146,6 +161,10 @@ static void fd_print_usage(void) {
 "    --sim-original=no|yes     simulate original precision [no]\n"
 "    --analyze-all=no|yes      analyze everything [yes]\n"
 "    --ignore-end=no|yes       ignore end requests [no]\n"
+"    --error-localization=no|yes print large error and its location [no]\n"
+"    --print-every-error=no|yes  print the error of every statement [no]\n"
+"    --detect-pso=no|yes	   detect and fix precision-specific operations [no]\n"
+"    --goto-shadow-branch=no|yes choose branch according to shadow vlaue (high-precision) [no]\n"
 	);
 }
 
@@ -188,7 +207,16 @@ static mpfr_t compareIntroErr1, compareIntroErr2;
 static mpfr_t writeSvOrg, writeSvDiff, writeSvRelError;
 static mpfr_t cancelTemp;
 static mpfr_t arg1tmpX, arg2tmpX, arg3tmpX;
+static mpfr_t arg1midX, arg2midX, arg3midX;
+static mpfr_t arg1oriX, arg2oriX, arg3oriX;
 
+/* Detecting precision-specific operations*/
+static VgHashTable errorMap			= NULL;
+static VgHashTable detectedPSO		= NULL;
+static Bool findFirstPSO			= False;
+static Bool finishPSO				= False;
+static Int defaultEmin				= 0;
+static Int defaultEmax				= 0;
 
 static Char* mpfrToStringShort(Char* str, mpfr_t* fp) {
 	if (mpfr_cmp_ui(*fp, 0) == 0) {
@@ -232,10 +260,11 @@ static Char* mpfrToString(Char* str, mpfr_t* fp) {
 		str[0] = '-'; str[1] = '\0';
 	}
 
-	Char mpfr_str[60]; /* digits + 1 */
+	Char mpfr_str[100]; /* digits + 1 */
 	mpfr_exp_t exp;
 	/* digits_base10 = log10 ( 2^(significant bits) ) */
-	mpfr_get_str(mpfr_str, &exp, /* base */ 10, /* digits, float: 7, double: 15 */ 15, *fp, STD_RND);
+	mpfr_get_str(mpfr_str, &exp, /* base */ 10, /* digits, float: 7, double: 15 */ 60, *fp, STD_RND);
+	//mpfr_get_str(mpfr_str, &exp, /* base */ 10, /* digits, float: 7, double: 15 */ 60, *fp, STD_RND);
 	exp--;
 	VG_(strcat)(str, mpfr_str);
 
@@ -256,6 +285,36 @@ static Char* mpfrToString(Char* str, mpfr_t* fp) {
 	Char pre_str[50];
 	VG_(sprintf)(pre_str, ", %ld/%ld bit", pre_min, pre);
 	VG_(strcat)(str, pre_str);
+	return str;
+}
+
+static Char* mpfrToStringE(Char* str, mpfr_t* fp) {
+	Int sgn = mpfr_sgn(*fp);
+	if (sgn >= 0) {
+		str[0] = ' '; str[1] = '0'; str[2] = '\0';
+	} else {
+		str[0] = '-'; str[1] = '\0';
+	}
+
+	Char mpfr_str[100]; /* digits + 1 */
+	mpfr_exp_t exp;
+	/* digits_base10 = log10 ( 2^(significant bits) ) */
+	mpfr_get_str(mpfr_str, &exp, /* base */ 10, /* digits, float: 7, double: 15 */ 60, *fp, STD_RND);
+	//mpfr_get_str(mpfr_str, &exp, /* base */ 10, /* digits, float: 7, double: 15 */ 60, *fp, STD_RND);
+	exp--;
+	VG_(strcat)(str, mpfr_str);
+
+	if (sgn >= 0) {
+		str[1] = str[2];
+		str[2] = '.';
+	} else {
+		str[1] = str[2];
+		str[2] = '.';
+	}
+
+	Char exp_str[50];
+	VG_(sprintf)(exp_str, "e%ld", exp);
+	VG_(strcat)(str, exp_str);
 	return str;
 }
 
@@ -336,6 +395,8 @@ ShadowValue* initShadowValue(UWord key) {
 	sv->orgType = Ot_INVALID;
 
 	mpfr_init(sv->value);
+	mpfr_init(sv->midValue);
+	mpfr_init(sv->oriValue);
 
 	avMallocs++;
 	return sv;
@@ -346,6 +407,8 @@ void freeShadowValue(ShadowValue* sv, Bool freeSvItself) {
 	tl_assert(sv != NULL);
 
 	mpfr_clear(sv->value);
+	mpfr_clear(sv->midValue);
+	mpfr_clear(sv->oriValue);
 	if (freeSvItself) {
 		VG_(free)(sv);
 	}
@@ -358,6 +421,8 @@ void copyShadowValue(ShadowValue* newSv, ShadowValue* sv) {
 
 	if (clo_simulateOriginal) {
 		mpfr_set_prec(newSv->value, mpfr_get_prec(sv->value));
+		mpfr_set_prec(newSv->midValue, mpfr_get_prec(sv->midValue));
+		mpfr_set_prec(newSv->oriValue, mpfr_get_prec(sv->oriValue));
 	}
 
 	mpfr_set(newSv->value, sv->value, STD_RND);
@@ -365,7 +430,11 @@ void copyShadowValue(ShadowValue* newSv, ShadowValue* sv) {
 	newSv->origin = sv->origin;
 	newSv->canceled = sv->canceled;
 	newSv->cancelOrigin = sv->cancelOrigin;
-	newSv->orgType = Ot_INVALID;
+	// newSv->orgType = Ot_INVALID;
+	newSv->orgType = sv->orgType; // added by ran
+	newSv->Org.db = sv->Org.db; // added by ran
+	mpfr_set(newSv->midValue, sv->midValue, STD_RND);
+	mpfr_set(newSv->oriValue, sv->oriValue, STD_RND);
 
 	/* Do not overwrite active or version!
 	   They should be set before. */
@@ -738,6 +807,330 @@ void readSTemp(Int num, mpfr_t* fp) {
 	}
 }
 
+static void getFileName(Char* name) {
+	Char tempName[256];
+	struct vg_stat st;
+	int i;
+	for (i = 1; i < 100; ++i) {
+		VG_(sprintf)(tempName, "%s_%d", name, i);
+		SysRes res = VG_(stat)(tempName, &st);
+		if (sr_isError(res)) {
+			break;
+		}
+	}
+	VG_(sprintf)(name, "%s_%d", name, i);
+}
+
+static __inline__
+void fwrite_flush(void) {
+    if ((fwrite_fd>=0) && (fwrite_pos>0)) {
+		VG_(write)(fwrite_fd, (void*)fwrite_buf, fwrite_pos);
+	}
+    fwrite_pos = 0;
+}
+
+static void my_fwrite(Int fd, Char* buf, Int len) {
+    if (fwrite_fd != fd) {
+		fwrite_flush();
+		fwrite_fd = fd;
+    }
+    if (len > FWRITE_THROUGH) {
+		fwrite_flush();
+		VG_(write)(fd, (void*)buf, len);
+		return;
+    }
+    if (FWRITE_BUFSIZE - fwrite_pos <= len) {
+		fwrite_flush();
+	}
+    VG_(strncpy)(fwrite_buf + fwrite_pos, buf, len);
+    fwrite_pos += len;
+}
+
+static void dumpPSO() {
+	Char fname[256];
+	HChar* clientName = VG_(args_the_exename);
+	VG_(sprintf)(fname, "%s_pso.log", clientName);
+
+	getFileName(fname);
+	SysRes fileRes = VG_(open)(fname, VKI_O_CREAT|VKI_O_TRUNC|VKI_O_WRONLY, VKI_S_IRUSR|VKI_S_IWUSR);
+	if (sr_isError(fileRes)) {
+		VG_(umsg)("SHADOW VALUES (%s): Failed to create or open the file!\n", fname);
+		return;
+	}
+	Int file = sr_Res(fileRes);
+
+	VG_(umsg)("Dump PSO into %s\n", fname);
+	PSOperation * next;
+	VG_(HT_ResetIter)(detectedPSO);
+	while (next = VG_(HT_Next)(detectedPSO)) {
+		VG_(describe_IP)(next->key, description, DESCRIPTION_SIZE);
+		VG_(strcat)(description, "\n");
+		my_fwrite(file, (void*)description, VG_(strlen)(description));
+	}
+	fwrite_flush();
+	VG_(close)(file);
+}
+
+static Bool isPSOFinished() {
+	if (!clo_detect_pso) return True;
+	return finishPSO;
+}
+
+static void collectPSO() {
+	ErrorCount* next;
+	VG_(HT_ResetIter)(errorMap);
+	while (next = VG_(HT_Next)(errorMap)) {
+		if (next->errCnt > next->totalCnt * PSO_PERCENTIGE_THRESHOLD) {
+			PSOperation* p = VG_(malloc)("fd.initPSOperation.1", sizeof(PSOperation));
+			p->key = next->key;
+			p->falsePositive = next->ovCnt * 1.0 / next->totalCnt > PSO_FALSEPOSITIVE_PERCENTAGE ? True : False;
+			VG_(HT_add_node)(detectedPSO, p);
+			finishPSO = False;
+			VG_(describe_IP)(p->key, description, DESCRIPTION_SIZE);
+			VG_(umsg)("PSO at 			%s\n", description);
+			VG_(umsg)("Total count 		%d\n", next->totalCnt);
+			VG_(umsg)("Error count 		%d\n", next->errCnt);
+			VG_(umsg)("Negative count   %d\n", next->ovCnt);
+		}
+	}
+}
+
+static void beginOneRun() {
+	if (!clo_detect_pso) return;
+	VG_(umsg)("One run for PSO detection begin.\n");
+	errorMap = VG_(HT_construct)("Error map for detecting precision-specific operations");
+	finishPSO = False;
+}
+
+static void endOneRun() {
+	if (!clo_detect_pso) return;
+	finishPSO = True;
+	collectPSO();
+	UInt n_memory = 0;
+	ErrorCount** memory = VG_(HT_to_array)(errorMap, &n_memory);
+	VG_(free)(memory);
+	VG_(HT_destruct)(errorMap);
+	VG_(umsg)("One run for PSO detection end.\n");
+	if (finishPSO) {
+		UWord temp[PSO_SIZE];
+		int tempSize = 0;
+
+		PSOperation* next;
+		VG_(HT_ResetIter)(detectedPSO);
+		while (next = VG_(HT_Next)(detectedPSO)) {
+			if (next->falsePositive) {
+				temp[tempSize++] = next->key;
+			}
+		}
+
+		int i = 0;
+		for(; i < tempSize; i++) {
+			VG_(umsg)("Remove 0x%llX from precision-specific operations\n", (ULong)temp[i]);
+			VG_(HT_remove)(detectedPSO, temp[i]);
+		}
+
+		VG_(HT_ResetIter)(detectedPSO);
+		while (next = VG_(HT_Next)(detectedPSO)) {
+			VG_(umsg)("Probable PSO at 0x%llX \n", (ULong)next->key);
+		}
+
+		dumpPSO();
+	}
+}
+
+static void beginOneInstance() {
+	if (!clo_detect_pso) return;
+	findFirstPSO = False;
+}
+
+static ErrorCount * initErrorCount() {
+	ErrorCount * e = VG_(malloc)("fd.initErrorCount.1", sizeof(ErrorCount));
+	e->errCnt = 0;
+	e->ovCnt = 0;
+	e->totalCnt = 0;
+	return e;
+}
+
+static void checkAndRecover(ShadowValue* svalue) {
+	if (svalue) {
+		mpfr_t org;
+		mpfr_init(org);
+
+		if (svalue->orgType == Ot_FLOAT) {
+			mpfr_set_prec(org, 24);
+			mpfr_set_flt(org, svalue->Org.fl, STD_RND);
+		} else if (svalue->orgType == Ot_DOUBLE) {
+			mpfr_set_prec(org, 53);
+			mpfr_set_d(org, svalue->Org.db, STD_RND);
+		} else {
+			tl_assert(False);
+		}
+
+		if (mpfr_cmp(org, svalue->oriValue)) {
+			VG_(umsg)("There may exists untracked operations! Recovering...\n");
+			// Char mpfrBuf[MPFR_BUFSIZE];
+			// mpfrToString(mpfrBuf, &org);
+			// VG_(umsg)("ORI: %s\n", mpfrBuf);
+			// mpfrToString(mpfrBuf, &(svalue->oriValue));
+			// VG_(umsg)("SMU: %s\n", mpfrBuf);
+			mpfr_set(svalue->value, org, STD_RND);
+			mpfr_set(svalue->midValue, org, STD_RND);
+			mpfr_set(svalue->oriValue, org, STD_RND);
+		}
+
+		mpfr_clear(org);
+	}
+}
+
+static void computeRelativeError(ShadowValue* svalue, mpfr_t rel) {
+	if ((!clo_detect_pso) || finishPSO) return;
+	if (svalue) {
+		mpfr_t org;
+		mpfr_init(org);
+
+		if (svalue->orgType == Ot_FLOAT) {
+			mpfr_set_flt(org, svalue->Org.fl, STD_RND);
+		} else if (svalue->orgType == Ot_DOUBLE) {
+			mpfr_set_d(org, svalue->Org.db, STD_RND);
+		} else {
+			tl_assert(False);
+		}
+
+		if (mpfr_cmp_ui(svalue->value, 0) != 0 || mpfr_cmp_ui(org, 0) != 0) {
+			mpfr_reldiff(rel, svalue->value, org, STD_RND);
+			mpfr_abs(rel, rel, STD_RND);
+		} else {
+			mpfr_set_ui(rel, 0, STD_RND);
+		}
+
+		mpfr_clear(org);
+	} else {
+		mpfr_set_ui(rel, 0, STD_RND);
+	}
+}
+
+static void printErrorShort(ShadowValue* svalue) {
+	if (clo_detect_pso || clo_print_every_error || clo_error_localization) {
+		if (svalue) {
+			mpfr_t org, rel;
+			mpfr_inits(org, rel, NULL);
+
+			if (svalue->orgType == Ot_FLOAT) {
+				mpfr_set_flt(org, svalue->Org.fl, STD_RND);
+			} else if (svalue->orgType == Ot_DOUBLE) {
+				mpfr_set_d(org, svalue->Org.db, STD_RND);
+			} else {
+				tl_assert(False);
+			}
+
+			if (mpfr_cmp_ui(svalue->value, 0) != 0 || mpfr_cmp_ui(org, 0) != 0) {
+				mpfr_reldiff(rel, svalue->value, org, STD_RND);
+				mpfr_abs(rel, rel, STD_RND);
+			} else {
+				mpfr_set_ui(rel, 0, STD_RND);
+			}
+
+			if (clo_detect_pso || clo_print_every_error || mpfr_cmp_d(rel, 1e-10) >= 0) {
+				VG_(describe_IP)(svalue->origin, description, DESCRIPTION_SIZE);
+				VG_(umsg)("Location: %s\n", description);
+				Char mpfrBuf[MPFR_BUFSIZE];
+				mpfrToString(mpfrBuf, &org);
+				VG_(umsg)("ORIGINAL:         %s\n", mpfrBuf);
+				mpfrToString(mpfrBuf, &(svalue->oriValue));
+				VG_(umsg)("SIMULATE VALUE:   	 %s\n", mpfrBuf);
+				mpfrToString(mpfrBuf, &(svalue->midValue));
+				VG_(umsg)("MIDDLE VALUE:   	 %s\n", mpfrBuf);
+				mpfrToString(mpfrBuf, &(svalue->value));
+				VG_(umsg)("SHADOW VALUE:     %s\n", mpfrBuf);
+				mpfrToString(mpfrBuf, &rel);
+				VG_(umsg)("RELATIVE ERROR:   %s\n\n", mpfrBuf);
+			}
+			mpfr_clears(rel, org, NULL);
+		} else if (clo_print_every_error) {
+			VG_(umsg)("There exists no shadow value.\n");
+		}
+	}
+}
+
+static void analyzePSO(mpfr_t irel, ShadowValue* o) {
+	if (findFirstPSO || (!clo_detect_pso) || finishPSO) {
+		return;
+	}
+
+	// Calculate error inflation
+	mpfr_t orel;
+	mpfr_init(orel);
+	computeRelativeError(o, orel);
+
+	mpfr_t inflation;
+	mpfr_init(inflation);
+	if (mpfr_cmp_ui(irel, 0) != 0) {
+		mpfr_div(inflation, orel, irel, STD_RND);
+		mpfr_abs(inflation, inflation, STD_RND);
+	} else if (mpfr_cmp_ui(orel, 0) != 0) {
+		mpfr_set(inflation, orel, STD_RND);
+	} else {
+		mpfr_set_ui(inflation, 0, STD_RND);
+	}
+	// Char mpfrBuf[MPFR_BUFSIZE];
+	// mpfrToString(mpfrBuf, &inflation);
+	// VG_(umsg)("INFLATION:         %s\n", mpfrBuf);
+	// mpfr_t irelCopy;
+	// mpfr_init(irelCopy);
+	// mpfr_set(irelCopy, irel, STD_RND);
+	// mpfrToString(mpfrBuf, &irelCopy);
+	// VG_(umsg)("INPUT RELATIVE ERROR:         %s\n", mpfrBuf);
+	// mpfrToString(mpfrBuf, &orel);
+	// VG_(umsg)("OUTPUT RELATIVE ERROR:         %s\n", mpfrBuf);
+	// printErrorShort(o);
+
+	// Get original value.
+	mpfr_t org;
+	mpfr_init(org);
+
+	if (o->orgType == Ot_FLOAT) {
+		mpfr_set_flt(org, o->Org.fl, STD_RND);
+	} else if (o->orgType == Ot_DOUBLE) {
+		mpfr_set_d(org, o->Org.db, STD_RND);
+	} else {
+		tl_assert(False);
+	}
+	mpfr_abs(org, org, STD_RND);
+
+	// Add in maps
+	if (VG_(HT_lookup)(detectedPSO, o->origin) != NULL) {
+		if (mpfr_cmp_d(inflation, PSO_INFLATION_THRESHOLD) >= 0) {
+			// Should not reach here
+			// VG_(describe_IP)(o->origin, description, DESCRIPTION_SIZE);
+			// VG_(umsg)("Warning: a precision-specific operation is not fixed at %s\n", description);
+			// printErrorShort(o);
+		}
+		mpfr_clears(orel, inflation, org, NULL);
+		return;
+	}
+	mpfr_t temp;
+	mpfr_init(temp);
+	ErrorCount* cnt = VG_(HT_lookup)(errorMap, o->origin);
+	if (cnt == NULL) { 
+		cnt = initErrorCount();
+		cnt->key = o->origin;
+		VG_(HT_add_node)(errorMap, cnt);
+	}
+	if (mpfr_cmp_d(inflation, PSO_INFLATION_THRESHOLD) >= 0) {
+		mpfr_abs(temp, o->value, STD_RND);
+		if (mpfr_cmp_d(org, PSO_OV_ZERO_BOUND) < 0 && mpfr_cmp_d(temp, PSO_SV_ZERO_BOUND) < 0) {
+			cnt->ovCnt++;
+		}
+		cnt->errCnt++;
+		cnt->totalCnt++;
+		findFirstPSO = True;
+	} else {
+		cnt->totalCnt++;
+	}
+
+	mpfr_clears(orel, inflation, org, temp, NULL);
+}
+
 static Bool isOpFloat(IROp op) {
 	switch (op) {
 		/* unary float */
@@ -763,6 +1156,7 @@ static Bool isOpFloat(IROp op) {
 		case Iop_Div64F0x2:
 		case Iop_Min64F0x2:
 		case Iop_Max64F0x2:
+		case Iop_CmpF64:
 		/* ternary double */
 		case Iop_AddF64:
 		case Iop_SubF64:
@@ -770,13 +1164,23 @@ static Bool isOpFloat(IROp op) {
 		case Iop_DivF64:
 			return False;
 		default:
-			// TODO warn
-			//VG_(tool_panic)("Unhandled operation in isOpFloat\n");
+			VG_(tool_panic)("Unhandled operation in isOpFloat\n");
 			return False;
 	}
 }
 
+static void beginEmulateDouble() {
+	mpfr_set_emin(-1073);
+	mpfr_set_emax(1024);
+}
+
+static void endEmulate() {
+	mpfr_set_emin(defaultEmin);
+	mpfr_set_emax(defaultEmax);
+}
+
 static VG_REGPARM(2) void processUnOp(Addr addr, UWord ca) {
+	// Do not analyze unary operation, because they are not precision-specific
 	if (!clo_analyze) return;
 
 	Int constArgs = (Int)ca;
@@ -784,61 +1188,126 @@ static VG_REGPARM(2) void processUnOp(Addr addr, UWord ca) {
 	Addr argOrigin = 0;
 	mpfr_exp_t argCanceled = 0;
 	Addr argCancelOrigin = 0;
+	// mpfr_t irel;
+	// mpfr_init(irel);
  
 	if (clo_simulateOriginal) {
-		if (isOpFloat(binOpArgs->op)) {
+		if (isOpFloat(unOpArgs->op)) {
 			mpfr_set_prec(arg1tmpX, 24);
 		} else {
 			mpfr_set_prec(arg1tmpX, 53);
 		}
 	}
 
+	if (isOpFloat(unOpArgs->op)) {
+		mpfr_set_prec(arg1midX, 24);
+		mpfr_set_prec(arg1oriX, 24);
+	} else {
+		mpfr_set_prec(arg1midX, 53);
+		mpfr_set_prec(arg1oriX, 53);
+	}
+
 	if (constArgs & 0x1) {
 		readSConst(0, &(arg1tmpX));
+		mpfr_set(arg1midX, arg1tmpX, STD_RND);
+		beginEmulateDouble();
+		int t = mpfr_set(arg1oriX, arg1tmpX, STD_RND);
+		mpfr_subnormalize(arg1oriX, t, STD_RND);
+		endEmulate();
 	} else {
 		ShadowValue* argTmp = getTemp(unOpArgs->arg);
+		// checkAndRecover(argTmp); // LIMITATION can not check here
+		// computeRelativeError(irel, argTmp);
 		if (argTmp) {
+			// Char mpfrBuf[MPFR_BUFSIZE];
+			// mpfrToString(mpfrBuf, &(argTmp->svalue));
+			// VG_(umsg)("SHADOW VALUE: %s\n", mpfrBuf);
+			// mpfrToString(mpfrBuf, &(argTmp->midValue));
+			// VG_(umsg)("MIDDLE VALUE: %s\n", mpfrBuf);
 			mpfr_set(arg1tmpX, argTmp->value, STD_RND);
+			mpfr_set(arg1midX, argTmp->midValue, STD_RND);
+			beginEmulateDouble();
+			int t = mpfr_set(arg1oriX, argTmp->oriValue, STD_RND);
+			mpfr_subnormalize(arg1oriX, t, STD_RND);
+			endEmulate();
 			argOpCount = argTmp->opCount;
 			argOrigin = argTmp->origin;
 			argCanceled = argTmp->canceled;
 			argCancelOrigin = argTmp->cancelOrigin;
 		} else {
 			readSTemp(0, &(arg1tmpX));
+			mpfr_set(arg1midX, arg1tmpX, STD_RND);
+			beginEmulateDouble();
+			int t = mpfr_set(arg1oriX, arg1tmpX, STD_RND);
+			mpfr_subnormalize(arg1oriX, t, STD_RND);
+			endEmulate();
 		}
 	}
 
 	ShadowValue* res = setTemp(unOpArgs->wrTmp);
 	if (clo_simulateOriginal) {
-		if (isOpFloat(binOpArgs->op)) {
+		if (isOpFloat(unOpArgs->op)) {
 			mpfr_set_prec(res->value, 24);
 		} else {
 			mpfr_set_prec(res->value, 53);
 		}
+	}
+	if (isOpFloat(unOpArgs->op)) {
+		mpfr_set_prec(res->midValue, 24);
+		mpfr_set_prec(res->oriValue, 24);
+	} else {
+		mpfr_set_prec(res->midValue, 53);
+		mpfr_set_prec(res->oriValue, 53);
 	}
 	res->opCount = argOpCount + 1;
 	res->origin = addr;
 
 	fpOps++;
 
+	// Bool needFix = clo_detect_pso && VG_(HT_lookup)(detectedPSO, addr) != NULL;
+	// if (needFix) {
+	// 	mpfr_set(arg1midX, arg1tmpX, STD_RND);
+	// }
+
 	IROp op = unOpArgs->op;
+	int tv;
 	switch (op) {
 		case Iop_Sqrt32F0x4:
 		case Iop_Sqrt64F0x2:
 			mpfr_sqrt(res->value, arg1tmpX, STD_RND);
+			mpfr_sqrt(res->midValue, arg1midX, STD_RND);
+			beginEmulateDouble();	
+			tv = mpfr_sqrt(res->oriValue, arg1oriX, STD_RND);
+			mpfr_subnormalize(res->oriValue, tv, STD_RND);
+			endEmulate();
 			break;
 		case Iop_NegF32:
 		case Iop_NegF64:
 			mpfr_neg(res->value, arg1tmpX, STD_RND);
+			mpfr_neg(res->midValue, arg1midX, STD_RND);
+			beginEmulateDouble();
+			tv = mpfr_neg(res->oriValue, arg1oriX, STD_RND);
+			mpfr_subnormalize(res->oriValue, tv, STD_RND);
+			endEmulate();
 			break;
 		case Iop_AbsF32:
 		case Iop_AbsF64:
 			mpfr_abs(res->value, arg1tmpX, STD_RND);
+			mpfr_abs(res->midValue, arg1midX, STD_RND);
+			VG_(umsg)("In ABS!\n");
+			beginEmulateDouble();
+			tv = mpfr_abs(res->oriValue, arg1oriX, STD_RND);
+			mpfr_subnormalize(res->oriValue, tv, STD_RND);
+			endEmulate();
 			break;
 		default:
 			VG_(tool_panic)("Unhandled case in processUnOp\n");
 			break;
 	}
+
+	// if (needFix) {
+	// 	mpfr_set(res->value, res->midValue, STD_RND);
+	// }
 
 	res->canceled = argCanceled;
 	res->cancelOrigin = argCancelOrigin;
@@ -850,6 +1319,21 @@ static VG_REGPARM(2) void processUnOp(Addr addr, UWord ca) {
 			mpfr_set_d(meanOrg, unOpArgs->orgDouble, STD_RND);
 		}
 		updateMeanValue(addr, unOpArgs->op, &(res->value), 0, argOrigin, 0, 0);
+	}
+
+	if (isOpFloat(unOpArgs->op)) {
+		res->Org.fl = unOpArgs->orgFloat;
+		res->orgType = Ot_FLOAT;
+	} else {
+		res->Org.db = unOpArgs->orgDouble;
+		res->orgType = Ot_DOUBLE;
+	}
+	// if (clo_detect_pso && !finishPSO) {
+	// 	analyzePSO(irel, res);
+	// }
+	// mpfr_clear(irel);
+	if (clo_print_every_error) {
+		printErrorShort(res);
 	}
 }
 
@@ -903,6 +1387,7 @@ static VG_REGPARM(2) void processBinOp(Addr addr, UWord ca) {
 	if (!clo_analyze) return;
 
 	Int constArgs = (Int)ca;
+	Bool needFix = clo_detect_pso && VG_(HT_lookup)(detectedPSO, addr) != NULL;
 
 	if (clo_simulateOriginal) {
 		if (isOpFloat(binOpArgs->op)) {
@@ -914,6 +1399,18 @@ static VG_REGPARM(2) void processBinOp(Addr addr, UWord ca) {
 		}
 	}
 
+	if (isOpFloat(binOpArgs->op)) {
+		mpfr_set_prec(arg1midX, 24);
+		mpfr_set_prec(arg2midX, 24);
+		mpfr_set_prec(arg1oriX, 24);
+		mpfr_set_prec(arg2oriX, 24);
+	} else {
+		mpfr_set_prec(arg1midX, 53);
+		mpfr_set_prec(arg2midX, 53);
+		mpfr_set_prec(arg1oriX, 53);
+		mpfr_set_prec(arg2oriX, 53);
+	}
+
 	ULong arg1opCount = 0;
 	ULong arg2opCount = 0;
 	Addr arg1origin = 0;
@@ -923,6 +1420,8 @@ static VG_REGPARM(2) void processBinOp(Addr addr, UWord ca) {
 	mpfr_exp_t canceled = 0;
 	Addr arg1CancelOrigin = 0;
 	Addr arg2CancelOrigin = 0;
+	mpfr_t irel1, irel2;
+	mpfr_inits(irel1, irel2, NULL);
 
 	Int exactBitsArg1, exactBitsArg2;
 	if (isOpFloat(binOpArgs->op)) {
@@ -935,10 +1434,24 @@ static VG_REGPARM(2) void processBinOp(Addr addr, UWord ca) {
 
 	if (constArgs & 0x1) {
 		readSConst(0, &(arg1tmpX));
+		mpfr_set(arg1midX, arg1tmpX, STD_RND);
+		beginEmulateDouble();
+		int t = mpfr_set(arg1oriX, arg1tmpX, STD_RND);
+		mpfr_subnormalize(arg1oriX, t, STD_RND);
+		endEmulate();
 	} else {
 		ShadowValue* arg1tmp = getTemp(binOpArgs->arg1);
+		checkAndRecover(arg1tmp);
+		computeRelativeError(arg1tmp, irel1);
+		// if (needFix) printErrorShort(arg1tmp);
 		if (arg1tmp) {
+			// VG_(umsg)("have shadow 1\n");
 			mpfr_set(arg1tmpX, arg1tmp->value, STD_RND);
+			mpfr_set(arg1midX, arg1tmp->midValue, STD_RND);
+			beginEmulateDouble();
+			int t = mpfr_set(arg1oriX, arg1tmp->oriValue, STD_RND);
+			mpfr_subnormalize(arg1oriX, t, STD_RND);
+			endEmulate();
 			arg1opCount = arg1tmp->opCount;
 			arg1origin = arg1tmp->origin;
 			arg1canceled = arg1tmp->canceled;
@@ -962,15 +1475,35 @@ static VG_REGPARM(2) void processBinOp(Addr addr, UWord ca) {
 			}
 		} else {
 			readSTemp(0, &(arg1tmpX));
+			mpfr_set(arg1midX, arg1tmpX, STD_RND);
+			beginEmulateDouble();
+			int t = mpfr_set(arg1oriX, arg1tmpX, STD_RND);
+			mpfr_subnormalize(arg1oriX, t, STD_RND);
+			endEmulate();
 		}
 	}
 
 	if (constArgs & 0x2) {
 		readSConst(1, &(arg2tmpX));
+		mpfr_set(arg2midX, arg2tmpX, STD_RND);
+		beginEmulateDouble();
+		int t = mpfr_set(arg2oriX, arg2tmpX, STD_RND);
+		mpfr_subnormalize(arg2oriX, t, STD_RND);
+		endEmulate();
 	} else {
 		ShadowValue* arg2tmp = getTemp(binOpArgs->arg2);
+		checkAndRecover(arg2tmp);
+		// VG_(umsg)("get %X\n", binOpArgs->arg2);
+		computeRelativeError(arg2tmp, irel2);
 		if (arg2tmp) {
+			// if (needFix) printErrorShort(arg2tmp);
+			// VG_(umsg)("have shadow 2\n");
 			mpfr_set(arg2tmpX, arg2tmp->value, STD_RND);
+			mpfr_set(arg2midX, arg2tmp->midValue, STD_RND);
+			beginEmulateDouble();
+			int t = mpfr_set(arg2oriX, arg2tmp->oriValue, STD_RND);
+			mpfr_subnormalize(arg2oriX, t, STD_RND);
+			endEmulate();
 			arg2opCount = arg2tmp->opCount;
 			arg2origin = arg2tmp->origin;
 			arg2canceled = arg2tmp->canceled;
@@ -994,10 +1527,16 @@ static VG_REGPARM(2) void processBinOp(Addr addr, UWord ca) {
 			}
 		} else {
 			readSTemp(1, &(arg2tmpX));
+			mpfr_set(arg2midX, arg2tmpX, STD_RND);
+			beginEmulateDouble();
+			int t = mpfr_set(arg2oriX, arg2tmpX, STD_RND);
+			mpfr_subnormalize(arg2oriX, t, STD_RND);
+			endEmulate();
 		}
 	}
 
 	ShadowValue* res = setTemp(binOpArgs->wrTmp);
+	// VG_(umsg)("processBinOp %X\n", binOpArgs->wrTmp);
 	if (clo_simulateOriginal) {
 		if (isOpFloat(binOpArgs->op)) {
 			mpfr_set_prec(res->value, 24);
@@ -1005,6 +1544,15 @@ static VG_REGPARM(2) void processBinOp(Addr addr, UWord ca) {
 			mpfr_set_prec(res->value, 53);
 		}
 	}
+
+	if (isOpFloat(binOpArgs->op)) {
+		mpfr_set_prec(res->midValue, 24);
+		mpfr_set_prec(res->oriValue, 24);
+	} else {
+		mpfr_set_prec(res->midValue, 53);
+		mpfr_set_prec(res->oriValue, 53);
+	}
+
 	res->opCount = 1;
 	if (arg1opCount > arg2opCount) {
 		res->opCount += arg1opCount;
@@ -1015,32 +1563,74 @@ static VG_REGPARM(2) void processBinOp(Addr addr, UWord ca) {
 
 	fpOps++;
 
+	if (needFix) {
+		// VG_(umsg)("Need fix!\n");
+		mpfr_set(arg1midX, arg1tmpX, STD_RND);
+		mpfr_set(arg2midX, arg2tmpX, STD_RND);
+		// Char mpfrBuf[MPFR_BUFSIZE];
+		// mpfrToString(mpfrBuf, &arg1midX);
+		// VG_(umsg)("Mid1 %s\n", mpfrBuf);
+		// mpfrToString(mpfrBuf, &arg2midX);
+		// VG_(umsg)("Mid2 %s\n", mpfrBuf);
+	}
+
+	int tv;
 	switch (binOpArgs->op) {
 		case Iop_Add32F0x4:
 		case Iop_Add64F0x2:
 			mpfr_add(res->value, arg1tmpX, arg2tmpX, STD_RND);
+			mpfr_add(res->midValue, arg1midX, arg2midX, STD_RND);
+			beginEmulateDouble();
+			tv = mpfr_add(res->oriValue, arg1oriX, arg2oriX, STD_RND);
+			mpfr_subnormalize(res->oriValue, tv, STD_RND);
+			endEmulate();
 			canceled = getCanceledBits(&(res->value), &(arg1tmpX), &(arg2tmpX));
 			break;
 		case Iop_Sub32F0x4:
 		case Iop_Sub64F0x2:
 			mpfr_sub(res->value, arg1tmpX, arg2tmpX, STD_RND);
+			mpfr_sub(res->midValue, arg1midX, arg2midX, STD_RND);
+			beginEmulateDouble();
+			tv = mpfr_sub(res->oriValue, arg1oriX, arg2oriX, STD_RND);
+			mpfr_subnormalize(res->oriValue, tv, STD_RND);
+			endEmulate();
 			canceled = getCanceledBits(&(res->value), &(arg1tmpX), &(arg2tmpX));
 			break;
 		case Iop_Mul32F0x4:
 		case Iop_Mul64F0x2:
 			mpfr_mul(res->value, arg1tmpX, arg2tmpX, STD_RND);
+			mpfr_mul(res->midValue, arg1midX, arg2midX, STD_RND);
+			beginEmulateDouble();
+			tv = mpfr_mul(res->oriValue, arg1oriX, arg2oriX, STD_RND);
+			mpfr_subnormalize(res->oriValue, tv, STD_RND);
+			endEmulate();
 			break;
 		case Iop_Div32F0x4:
 		case Iop_Div64F0x2:
 			mpfr_div(res->value, arg1tmpX, arg2tmpX, STD_RND);
+			mpfr_div(res->midValue, arg1midX, arg2midX, STD_RND);
+			beginEmulateDouble();
+			tv = mpfr_div(res->oriValue, arg1oriX, arg2oriX, STD_RND);
+			mpfr_subnormalize(res->oriValue, tv, STD_RND);
+			endEmulate();
 			break;
 		case Iop_Min32F0x4:
 		case Iop_Min64F0x2:
 			mpfr_min(res->value, arg1tmpX, arg2tmpX, STD_RND);
+			mpfr_min(res->midValue, arg1midX, arg2midX, STD_RND);
+			beginEmulateDouble();
+			tv = mpfr_min(res->oriValue, arg1oriX, arg2oriX, STD_RND);
+			mpfr_subnormalize(res->oriValue, tv, STD_RND);
+			endEmulate();
 			break;
 		case Iop_Max32F0x4:
 		case Iop_Max64F0x2:
 			mpfr_max(res->value, arg1tmpX, arg2tmpX, STD_RND);
+			mpfr_max(res->midValue, arg1midX, arg2midX, STD_RND);
+			beginEmulateDouble();
+			tv = mpfr_max(res->oriValue, arg1oriX, arg2oriX, STD_RND);
+			mpfr_subnormalize(res->oriValue, tv, STD_RND);
+			endEmulate();
 			break;
 		default:
 			VG_(tool_panic)("Unhandled case in processBinOp\n");
@@ -1075,6 +1665,25 @@ static VG_REGPARM(2) void processBinOp(Addr addr, UWord ca) {
 			mpfr_set_d(meanOrg, binOpArgs->orgDouble, STD_RND);
 		}
 		updateMeanValue(addr, binOpArgs->op, &(res->value), canceled, arg1origin, arg2origin, cancellationBadness);
+	}
+
+	if (isOpFloat(binOpArgs->op)) {
+		res->Org.fl = binOpArgs->orgFloat;
+		res->orgType = Ot_FLOAT;
+	} else {
+		res->Org.db = binOpArgs->orgDouble;
+		res->orgType = Ot_DOUBLE;
+	}
+	if (needFix) {
+		mpfr_set(res->value, res->midValue, STD_RND);
+		// printErrorShort(res);
+	}
+	if (clo_detect_pso && !finishPSO) {
+		mpfr_max(irel1, irel1, irel2, STD_RND);
+		analyzePSO(irel1, res);
+	}
+	if (clo_print_every_error) {
+		printErrorShort(res);
 	}
 }
 
@@ -1150,13 +1759,25 @@ static VG_REGPARM(2) void processTriOp(Addr addr, UWord ca) {
 	IROp op = triOpArgs->op;
 
 	if (clo_simulateOriginal) {
-		if (isOpFloat(binOpArgs->op)) {
+		if (isOpFloat(op)) {
 			mpfr_set_prec(arg2tmpX, 24);
 			mpfr_set_prec(arg3tmpX, 24);
 		} else {
 			mpfr_set_prec(arg2tmpX, 53);
 			mpfr_set_prec(arg3tmpX, 53);
 		}
+	}
+
+	if (isOpFloat(op)) {
+		mpfr_set_prec(arg2midX, 24);
+		mpfr_set_prec(arg3midX, 24);
+		mpfr_set_prec(arg2oriX, 24);
+		mpfr_set_prec(arg3oriX, 24);
+	} else {
+		mpfr_set_prec(arg2midX, 53);
+		mpfr_set_prec(arg3midX, 53);
+		mpfr_set_prec(arg2oriX, 53);
+		mpfr_set_prec(arg3oriX, 53);
 	}
 
 	ULong arg2opCount = 0;
@@ -1168,9 +1789,11 @@ static VG_REGPARM(2) void processTriOp(Addr addr, UWord ca) {
 	mpfr_exp_t canceled = 0;
 	Addr arg2CancelOrigin = 0;
 	Addr arg3CancelOrigin = 0;
+	mpfr_t irel2, irel3;
+	mpfr_inits(irel2, irel3, NULL);
 
 	Int exactBitsArg2, exactBitsArg3;
-	if (isOpFloat(binOpArgs->op)) {
+	if (isOpFloat(op)) {
 		exactBitsArg2 = 23;
 		exactBitsArg3 = 23;
 	} else {
@@ -1180,10 +1803,22 @@ static VG_REGPARM(2) void processTriOp(Addr addr, UWord ca) {
 
 	if (constArgs & 0x2) {
 		readSConst(1, &(arg2tmpX));
+		mpfr_set(arg2midX, arg2tmpX, STD_RND);
+		beginEmulateDouble();
+		int t = mpfr_set(arg2oriX, arg2tmpX, STD_RND);
+		mpfr_subnormalize(arg2oriX, t, STD_RND);
+		endEmulate();
 	} else {
 		ShadowValue* arg2tmp = getTemp(triOpArgs->arg2);
+		checkAndRecover(arg2tmp);
+		computeRelativeError(arg2tmp, irel2);
 		if (arg2tmp) {
 			mpfr_set(arg2tmpX, arg2tmp->value, STD_RND);
+			mpfr_set(arg2midX, arg2tmp->midValue, STD_RND);
+			beginEmulateDouble();
+			int t = mpfr_set(arg2oriX, arg2tmp->oriValue, STD_RND);
+			mpfr_subnormalize(arg2oriX, t, STD_RND);
+			endEmulate();
 			arg2opCount = arg2tmp->opCount;
 			arg2origin = arg2tmp->origin;
 			arg2canceled = arg2tmp->canceled;
@@ -1207,15 +1842,32 @@ static VG_REGPARM(2) void processTriOp(Addr addr, UWord ca) {
 			}
 		} else {
 			readSTemp(1, &(arg2tmpX));
+			mpfr_set(arg2midX, arg2tmpX, STD_RND);
+			beginEmulateDouble();
+			int t = mpfr_set(arg2oriX, arg2tmpX, STD_RND);
+			mpfr_subnormalize(arg2oriX, t, STD_RND);
+			endEmulate();
 		}
 	}
 
 	if (constArgs & 0x4) {
 		readSConst(2, &(arg3tmpX));
+		mpfr_set(arg3midX, arg3tmpX, STD_RND);
+		beginEmulateDouble();
+		int t = mpfr_set(arg3oriX, arg3tmpX, STD_RND);
+		mpfr_subnormalize(arg3oriX, t, STD_RND);
+		endEmulate();
 	} else {
 		ShadowValue* arg3tmp = getTemp(triOpArgs->arg3);
+		checkAndRecover(arg3tmp);
+		computeRelativeError(arg3tmp, irel3);
 		if (arg3tmp) {
 			mpfr_set(arg3tmpX, arg3tmp->value, STD_RND);
+			mpfr_set(arg3midX, arg3tmp->midValue, STD_RND);
+			beginEmulateDouble();
+			int t = mpfr_set(arg3oriX, arg3tmp->oriValue, STD_RND);
+			mpfr_subnormalize(arg3oriX, t, STD_RND);
+			endEmulate();
 			arg3opCount = arg3tmp->opCount;
 			arg3origin = arg3tmp->origin;
 			arg3canceled = arg3tmp->canceled;
@@ -1239,17 +1891,31 @@ static VG_REGPARM(2) void processTriOp(Addr addr, UWord ca) {
 			}
 		} else {
 			readSTemp(2, &(arg3tmpX));
+			mpfr_set(arg3midX, arg3tmpX, STD_RND);
+			beginEmulateDouble();
+			int t = mpfr_set(arg3oriX, arg3tmpX, STD_RND);
+			mpfr_subnormalize(arg3oriX, t, STD_RND);
+			endEmulate();
 		}
 	}
 
 	ShadowValue* res = setTemp(triOpArgs->wrTmp);
 	if (clo_simulateOriginal) {
-		if (isOpFloat(binOpArgs->op)) {
+		if (isOpFloat(op)) {
 			mpfr_set_prec(res->value, 24);
 		} else {
 			mpfr_set_prec(res->value, 53);
 		}
 	}
+
+	if (isOpFloat(op)) {
+		mpfr_set_prec(res->midValue, 24);
+		mpfr_set_prec(res->oriValue, 24);
+	} else {
+		mpfr_set_prec(res->midValue, 53);
+		mpfr_set_prec(res->oriValue, 53);
+	}
+
 	res->opCount = 1;
 	if (arg2opCount > arg3opCount) {
 		res->opCount += arg2opCount;
@@ -1260,24 +1926,55 @@ static VG_REGPARM(2) void processTriOp(Addr addr, UWord ca) {
 
 	fpOps++;
 
+	Bool needFix = clo_detect_pso && VG_(HT_lookup)(detectedPSO, addr) != NULL;
+	if (needFix) {
+		mpfr_set(arg2midX, arg2tmpX, STD_RND);
+		mpfr_set(arg3midX, arg3tmpX, STD_RND);
+	}
+
+	int tv;
 	switch (op) {
 		case Iop_AddF64:
 			mpfr_add(res->value, arg2tmpX, arg3tmpX, STD_RND);
+			mpfr_add(res->midValue, arg2midX, arg3midX, STD_RND);
+			beginEmulateDouble();
+			tv = mpfr_add(res->oriValue, arg2oriX, arg3oriX, STD_RND);
+			mpfr_subnormalize(res->oriValue, tv, STD_RND);
+			endEmulate();
 			canceled = getCanceledBits(&(res->value), &(arg2tmpX), &(arg3tmpX));
 			break;
 		case Iop_SubF64:
 			mpfr_sub(res->value, arg2tmpX, arg3tmpX, STD_RND);
+			mpfr_sub(res->midValue, arg2midX, arg3midX, STD_RND);
+			beginEmulateDouble();
+			tv = mpfr_sub(res->oriValue, arg2oriX, arg3oriX, STD_RND);
+			mpfr_subnormalize(res->oriValue, tv, STD_RND);
+			endEmulate();
 			canceled = getCanceledBits(&(res->value), &(arg2tmpX), &(arg3tmpX));
 			break;
 		case Iop_MulF64:
 			mpfr_mul(res->value, arg2tmpX, arg3tmpX, STD_RND);
+			mpfr_mul(res->midValue, arg2midX, arg3midX, STD_RND);
+			beginEmulateDouble();
+			tv = mpfr_mul(res->oriValue, arg2oriX, arg3oriX, STD_RND);
+			mpfr_subnormalize(res->oriValue, tv, STD_RND);
+			endEmulate();
 			break;
 		case Iop_DivF64:
 			mpfr_div(res->value, arg2tmpX, arg3tmpX, STD_RND);
+			mpfr_div(res->midValue, arg2midX, arg3midX, STD_RND);
+			beginEmulateDouble();
+			tv = mpfr_div(res->oriValue, arg2oriX, arg3oriX, STD_RND);
+			mpfr_subnormalize(res->oriValue, tv, STD_RND);
+			endEmulate();
 			break;
 		default:
 			VG_(tool_panic)("Unhandled case in processTriOp");
 			break;
+	}
+
+	if (needFix) {
+		mpfr_set(res->value, res->midValue, STD_RND);
 	}
 
 	mpfr_exp_t maxC = canceled;
@@ -1304,6 +2001,16 @@ static VG_REGPARM(2) void processTriOp(Addr addr, UWord ca) {
 
 		mpfr_set_d(meanOrg, triOpArgs->orgDouble, STD_RND);
 		updateMeanValue(addr, op, &(res->value), canceled, arg2origin, arg3origin, cancellationBadness);
+	}
+
+	res->Org.db = triOpArgs->orgDouble;
+	res->orgType = Ot_DOUBLE;
+	if (clo_detect_pso && !finishPSO) {
+		mpfr_max(irel2, irel2, irel3, STD_RND);
+		analyzePSO(irel2, res);
+	}
+	if (clo_print_every_error) {
+		printErrorShort(res);
 	}
 }
 
@@ -1369,7 +2076,246 @@ static void instrumentTriOp(IRSB* sb, IRTypeEnv* env, Addr addr, IRTemp wrTemp, 
 	addStmtToIRSB(sb, IRStmt_Dirty(di));
 }
 
+static VG_REGPARM(2) UInt processCmpF64(Addr addr, UWord ca) {
+	if (!clo_analyze) return;
+
+	Int constArgs = (Int)ca;
+
+	if (clo_simulateOriginal) {
+		if (isOpFloat(binOpArgs->op)) {
+			mpfr_set_prec(arg1tmpX, 24);
+			mpfr_set_prec(arg2tmpX, 24);
+		} else {
+			mpfr_set_prec(arg1tmpX, 53);
+			mpfr_set_prec(arg2tmpX, 53);
+		}
+	}
+
+	if (isOpFloat(binOpArgs->op)) {
+		mpfr_set_prec(arg1midX, 24);
+		mpfr_set_prec(arg2midX, 24);
+		mpfr_set_prec(arg1oriX, 24);
+		mpfr_set_prec(arg2oriX, 24);
+	} else {
+		mpfr_set_prec(arg1midX, 53);
+		mpfr_set_prec(arg2midX, 53);
+		mpfr_set_prec(arg1oriX, 53);
+		mpfr_set_prec(arg2oriX, 53);
+	}
+
+	ULong arg1opCount = 0;
+	ULong arg2opCount = 0;
+	Addr arg1origin = 0;
+	Addr arg2origin = 0;
+	mpfr_exp_t arg1canceled = 0;
+	mpfr_exp_t arg2canceled = 0;
+	mpfr_exp_t canceled = 0;
+	Addr arg1CancelOrigin = 0;
+	Addr arg2CancelOrigin = 0;
+	mpfr_t irel1, irel2;
+	mpfr_inits(irel1, irel2, NULL);
+
+	Int exactBitsArg1, exactBitsArg2;
+	if (isOpFloat(binOpArgs->op)) {
+		exactBitsArg1 = 23;
+		exactBitsArg2 = 23;
+	} else {
+		exactBitsArg1 = 52;
+		exactBitsArg2 = 52;
+	}
+
+	if (constArgs & 0x1) {
+		readSConst(0, &(arg1tmpX));
+		mpfr_set(arg1midX, arg1tmpX, STD_RND);
+		beginEmulateDouble();
+		int t = mpfr_set(arg1oriX, arg1tmpX, STD_RND);
+		mpfr_subnormalize(arg1oriX, t, STD_RND);
+		endEmulate();
+	} else {
+		ShadowValue* arg1tmp = getTemp(binOpArgs->arg1);
+		checkAndRecover(arg1tmp);
+		computeRelativeError(arg1tmp, irel1);
+		// if (needFix) printErrorShort(arg1tmp);
+		if (arg1tmp) {
+			// VG_(umsg)("have shadow 1\n");
+			mpfr_set(arg1tmpX, arg1tmp->value, STD_RND);
+			mpfr_set(arg1midX, arg1tmp->midValue, STD_RND);
+			beginEmulateDouble();
+			int t = mpfr_set(arg1oriX, arg1tmp->oriValue, STD_RND);
+			mpfr_subnormalize(arg1oriX, t, STD_RND);
+			endEmulate();
+			arg1opCount = arg1tmp->opCount;
+			arg1origin = arg1tmp->origin;
+			arg1canceled = arg1tmp->canceled;
+			arg1CancelOrigin = arg1tmp->cancelOrigin;
+
+			if (clo_bad_cancellations) {
+				readSTemp(0, &cancelTemp);
+				if (mpfr_get_exp(cancelTemp) == mpfr_get_exp(arg1tmpX)) {
+					mpfr_sub(cancelTemp, arg1tmpX, cancelTemp, STD_RND);
+					if (mpfr_cmp_ui(cancelTemp, 0) != 0) {
+						exactBitsArg1 = abs(mpfr_get_exp(arg1tmpX) - mpfr_get_exp(cancelTemp)) - 2;
+						if (arg1tmp->orgType == Ot_FLOAT && exactBitsArg1 > 23) {
+							exactBitsArg1 = 23;
+						} else if (arg1tmp->orgType == Ot_DOUBLE && exactBitsArg1 > 52) {
+							exactBitsArg1 = 52;
+						}
+					}
+				} else {
+					exactBitsArg1 = 0;
+				}
+			}
+		} else {
+			readSTemp(0, &(arg1tmpX));
+			mpfr_set(arg1midX, arg1tmpX, STD_RND);
+			beginEmulateDouble();
+			int t = mpfr_set(arg1oriX, arg1tmpX, STD_RND);
+			mpfr_subnormalize(arg1oriX, t, STD_RND);
+			endEmulate();
+		}
+	}
+
+	if (constArgs & 0x2) {
+		readSConst(1, &(arg2tmpX));
+		mpfr_set(arg2midX, arg2tmpX, STD_RND);
+		beginEmulateDouble();
+		int t = mpfr_set(arg2oriX, arg2tmpX, STD_RND);
+		mpfr_subnormalize(arg2oriX, t, STD_RND);
+		endEmulate();
+	} else {
+		ShadowValue* arg2tmp = getTemp(binOpArgs->arg2);
+		checkAndRecover(arg2tmp);
+		// VG_(umsg)("get %X\n", binOpArgs->arg2);
+		computeRelativeError(arg2tmp, irel2);
+		if (arg2tmp) {
+			// if (needFix) printErrorShort(arg2tmp);
+			// VG_(umsg)("have shadow 2\n");
+			mpfr_set(arg2tmpX, arg2tmp->value, STD_RND);
+			mpfr_set(arg2midX, arg2tmp->midValue, STD_RND);
+			beginEmulateDouble();
+			int t = mpfr_set(arg2oriX, arg2tmp->oriValue, STD_RND);
+			mpfr_subnormalize(arg2oriX, t, STD_RND);
+			endEmulate();
+			arg2opCount = arg2tmp->opCount;
+			arg2origin = arg2tmp->origin;
+			arg2canceled = arg2tmp->canceled;
+			arg2CancelOrigin = arg2tmp->cancelOrigin;
+
+			if (clo_bad_cancellations) {
+				readSTemp(1, &cancelTemp);
+				if (mpfr_get_exp(cancelTemp) == mpfr_get_exp(arg2tmpX)) {
+					mpfr_sub(cancelTemp, arg2tmpX, cancelTemp, STD_RND);
+					if (mpfr_cmp_ui(cancelTemp, 0) != 0) {
+						exactBitsArg2 = abs(mpfr_get_exp(arg2tmpX) - mpfr_get_exp(cancelTemp)) - 2;
+						if (arg2tmp->orgType == Ot_FLOAT && exactBitsArg2 > 23) {
+							exactBitsArg2 = 23;
+						} else if (arg2tmp->orgType == Ot_DOUBLE && exactBitsArg2 > 52) {
+							exactBitsArg2 = 52;
+						}
+					}
+				} else {
+					exactBitsArg2 = 0;
+				}
+			}
+		} else {
+			readSTemp(1, &(arg2tmpX));
+			mpfr_set(arg2midX, arg2tmpX, STD_RND);
+			beginEmulateDouble();
+			int t = mpfr_set(arg2oriX, arg2tmpX, STD_RND);
+			mpfr_subnormalize(arg2oriX, t, STD_RND);
+			endEmulate();
+		}
+	}
+
+	int tv, oritv;
+	// Char mpfrBuf[MPFR_BUFSIZE];
+	// mpfrToString(mpfrBuf, &arg1tmpX);
+	// VG_(umsg)("ARG1:         %s\n", mpfrBuf);
+	// mpfrToString(mpfrBuf, &arg2tmpX);
+	// VG_(umsg)("ARG2:         %s\n", mpfrBuf);
+	// VG_(umsg)("original cond %d\n", binOpArgs->orgInt);
+	IRExpr* lastBranchResult = NULL;
+	switch (binOpArgs->op) {
+		case Iop_CmpF64:
+			tv = mpfr_cmp(arg1tmpX, arg2tmpX);
+			oritv = mpfr_cmp(arg1oriX, arg2oriX);
+			if (tv != oritv) {
+				VG_(describe_IP)(addr, description, DESCRIPTION_SIZE);
+				VG_(umsg)("Change branch at %s\n", description);
+			}
+			if (tv > 0) {
+				return Ircr_GT;
+			} else if (tv == 0) {
+				return Ircr_EQ;
+			} else {
+				return Ircr_LT;
+			}
+			break;
+		default:
+			VG_(tool_panic)("Unhandled case in processCmpF64\n");
+			break;
+	}
+
+	return lastBranchResult;
+}
+
+static void instrumentCmpF64(IRSB* sb, IRTypeEnv* env, Addr addr, IRTemp wrTemp, IRExpr* binop, Int arg1tmpInstead, Int arg2tmpInstead) {
+	tl_assert(binop->tag == Iex_Binop);
+
+	if (clo_ignoreLibraries && isInLibrary(addr)) {
+		return;
+	}
+
+	IROp op = binop->Iex.Binop.op;
+	IRExpr* arg1 = binop->Iex.Binop.arg1;
+	IRExpr* arg2 = binop->Iex.Binop.arg2;
+
+	tl_assert(arg1->tag == Iex_RdTmp || arg1->tag == Iex_Const);
+	tl_assert(arg2->tag == Iex_RdTmp || arg2->tag == Iex_Const);
+
+	Int constArgs = 0;
+
+	IRStmt* store = IRStmt_Store(Iend_LE, mkU64(&(binOpArgs->op)), mkU32(op));
+	addStmtToIRSB(sb, store);
+
+	if (arg1->tag == Iex_RdTmp) {
+		if (arg1tmpInstead >= 0) {
+			store = IRStmt_Store(Iend_LE, mkU64(&(binOpArgs->arg1)), mkU32(arg1tmpInstead));
+		} else {
+			store = IRStmt_Store(Iend_LE, mkU64(&(binOpArgs->arg1)), mkU32(arg1->Iex.RdTmp.tmp));
+		}
+		addStmtToIRSB(sb, store);
+
+		writeSTemp(sb, env, arg1->Iex.RdTmp.tmp, 0);
+	} else {
+		tl_assert(arg1->tag == Iex_Const);
+
+		writeSConst(sb, arg1->Iex.Const.con, 0);
+		constArgs |= 0x1;
+	}
+	if (arg2->tag == Iex_RdTmp) {
+		if (arg2tmpInstead >= 0) {
+			store = IRStmt_Store(Iend_LE, mkU64(&(binOpArgs->arg2)), mkU32(arg2tmpInstead));
+		} else {
+			store = IRStmt_Store(Iend_LE, mkU64(&(binOpArgs->arg2)), mkU32(arg2->Iex.RdTmp.tmp));
+		}
+		addStmtToIRSB(sb, store);
+
+		writeSTemp(sb, env, arg2->Iex.RdTmp.tmp, 1);
+	} else {
+		tl_assert(arg2->tag == Iex_Const);
+
+		writeSConst(sb, arg2->Iex.Const.con, 1);
+		constArgs |= 0x2;
+	}
+
+	IRExpr** argv = mkIRExprVec_2(mkU64(addr), mkU64(constArgs));
+	IRDirty* di = unsafeIRDirty_1_N(wrTemp, 2, "processCmpF64", VG_(fnptr_to_fnentry)(&processCmpF64), argv);
+	addStmtToIRSB(sb, IRStmt_Dirty(di));
+}
+
 static VG_REGPARM(1) void processMux0X(UWord ca) {
+	// VG_(umsg)("processMux0X\n");
 	if (!clo_analyze) return;
 
 	Int constArgs = (Int)ca;
@@ -1399,6 +2345,7 @@ static VG_REGPARM(1) void processMux0X(UWord ca) {
 	}
 
 	ShadowValue* res = setTemp(muxArgs->wrTmp);
+	// VG_(umsg)("processMux0X %X\n", muxArgs->wrTmp);
 	if (muxArgs->condVal) {
 		copyShadowValue(res, aexprX);
 	} else {
@@ -1458,8 +2405,14 @@ static VG_REGPARM(2) void processLoad(UWord tmp, Addr addr) {
 	if (!av || !(av->active)) {
 		return;
 	}
+	// VG_(umsg)("processLoad %X\n", tmp);
+	// VG_(umsg)("load address: %lX\n", addr);
 	ShadowValue* res = setTemp(tmp);
 	copyShadowValue(res, av);
+	// VG_(umsg)("av\n");
+	// printErrorShort(av);
+	// VG_(umsg)("res\n");
+	// printErrorShort(res);
 }
 
 static void instrumentLoad(IRSB* sb, IRTypeEnv* env, IRStmt* wrTmp) {
@@ -1477,6 +2430,7 @@ static void instrumentLoad(IRSB* sb, IRTypeEnv* env, IRStmt* wrTmp) {
 }
 
 static VG_REGPARM(3) void processStore(Addr addr, UWord t, UWord isFloat) {
+	// VG_(umsg)("processStore\n");
 	Int tmp = (Int)t;
 	ShadowValue* res = NULL;
 	ShadowValue* currentVal = VG_(HT_lookup)(globalMemory, addr);
@@ -1484,7 +2438,12 @@ static VG_REGPARM(3) void processStore(Addr addr, UWord t, UWord isFloat) {
 	if (clo_analyze && tmp >= 0) {
 		/* check if this memory address is shadowed */
 		ShadowValue* av = getTemp(tmp);
+		// VG_(umsg)("processStore %X\n", tmp);
+		// VG_(umsg)("Store address: %lX\n", addr);
+		// Addr lastAddr = addr - 4;
+
 		if (av) {
+			// VG_(umsg)("processStore2 %X\n", tmp);
 			if (currentVal) {
 				res = currentVal;
 				copyShadowValue(res, av);
@@ -1493,6 +2452,7 @@ static VG_REGPARM(3) void processStore(Addr addr, UWord t, UWord isFloat) {
 				res = initShadowValue((UWord)addr);
 				copyShadowValue(res, av);
 				VG_(HT_add_node)(globalMemory, res);
+				// VG_(umsg)("processStore create\n");
 			}
 
 			if ((Bool)isFloat) {
@@ -1566,6 +2526,7 @@ static void instrumentStore(IRSB* sb, IRTypeEnv* env, IRStmt* store, Int argTmpI
 }
 
 static VG_REGPARM(2) void processPut(UWord offset, UWord t) {
+	// VG_(umsg)("processPut\n");
 	ShadowValue* res = NULL;
 	ThreadId tid = VG_(get_running_tid)();
 	ShadowValue* currentVal = threadRegisters[tid][offset];
@@ -1619,6 +2580,7 @@ static void instrumentPut(IRSB* sb, IRTypeEnv* env, IRStmt* st, Int argTmpInstea
 }
 
 static VG_REGPARM(2) void processGet(UWord offset, UWord tmp) {
+	// VG_(umsg)("processGet\n");
 	if (!clo_analyze) return;
 
 	ThreadId tid = VG_(get_running_tid)();
@@ -1628,6 +2590,7 @@ static VG_REGPARM(2) void processGet(UWord offset, UWord tmp) {
 	}
 
 	ShadowValue* res = setTemp((Int)tmp);
+	// VG_(umsg)("processGet %X\n", tmp);
 	copyShadowValue(res, av);
 }
 
@@ -1645,6 +2608,7 @@ static void instrumentGet(IRSB* sb, IRTypeEnv* env, IRStmt* st) {
 }
 
 static VG_REGPARM(3) void processPutI(UWord t, UWord b, UWord n) {
+	// VG_(umsg)("processPutI\n");
 	Int tmp = (Int)t;
 	Int nElems = (Int)n;
 	Int base = (Int)b;
@@ -1716,6 +2680,7 @@ static void instrumentPutI(IRSB* sb, IRTypeEnv* env, IRStmt* st, Int argTmpInste
 }
 
 static VG_REGPARM(3) void processGetI(UWord tmp, UWord b, UWord n) {
+	// VG_(umsg)("processGetI\n");
 	if (!clo_analyze) return;
 
 	Int nElems = (Int)n;
@@ -1733,6 +2698,7 @@ static VG_REGPARM(3) void processGetI(UWord tmp, UWord b, UWord n) {
 	}
 
 	ShadowValue* res = setTemp((Int)tmp);
+	// VG_(umsg)("processGetI %X\n", tmp);
 	copyShadowValue(res, av);
 }
 
@@ -1895,7 +2861,7 @@ static IRSB* fd_instrument(VgCallbackClosure* closure, IRSB* sbIn,
 							case Iop_Min64F0x2:
 							case Iop_Max32F0x4:
 							case Iop_Max64F0x2:
-							/* case Iop_CmpF64: */
+							case Iop_CmpF64: 
 							case Iop_F64toF32:
 							case Iop_64HLtoV128:
 							case Iop_32HLto64:
@@ -2064,7 +3030,6 @@ static IRSB* fd_instrument(VgCallbackClosure* closure, IRSB* sbIn,
 	Int arg2tmpInstead = -1;
 
 	/* This is the main loop which hads instructions for the analysis (instrumentation).*/
-
 	for (/*use current i*/; i < sbIn->stmts_used; i++) {
 		IRStmt* st = sbIn->stmts[i];
 		if (!st || st->tag == Ist_NoOp) continue;
@@ -2196,11 +3161,26 @@ static IRSB* fd_instrument(VgCallbackClosure* closure, IRSB* sbIn,
 						break;
 					case Iex_Binop:
 						switch (expr->Iex.Binop.op) {
+							case Iop_CmpF64:
+								if (clo_goto_shadow_branch) {
+									arg1tmpInstead = -1;
+									arg2tmpInstead = -1;
+									if (expr->Iex.Binop.arg1->tag == Iex_RdTmp) {
+										arg1tmpInstead = tmpInstead[expr->Iex.Binop.arg1->Iex.RdTmp.tmp];
+									}
+									if (expr->Iex.Binop.arg2->tag == Iex_RdTmp) {
+										arg2tmpInstead = tmpInstead[expr->Iex.Binop.arg2->Iex.RdTmp.tmp];
+									}
+									instrumentCmpF64(sbOut, sbOut->tyenv, cia, st->Ist.WrTmp.tmp, expr, arg1tmpInstead, arg2tmpInstead);
+								} else {
+									addStmtToIRSB(sbOut, st);
+								}
+								break;
 							case Iop_Add32F0x4:
+							case Iop_Add64F0x2:
 							case Iop_Sub32F0x4:
 							case Iop_Mul32F0x4:
 							case Iop_Div32F0x4:
-							case Iop_Add64F0x2:
 							case Iop_Sub64F0x2:
 							case Iop_Mul64F0x2:
 							case Iop_Div64F0x2:
@@ -2220,7 +3200,6 @@ static IRSB* fd_instrument(VgCallbackClosure* closure, IRSB* sbIn,
 								}
 								instrumentBinOp(sbOut, tyenv, cia, st->Ist.WrTmp.tmp, expr, arg1tmpInstead, arg2tmpInstead);
 								break;
-							case Iop_CmpF64:
 							case Iop_F64toF32:
 							case Iop_64HLtoV128:
 							case Iop_32HLto64:
@@ -2357,7 +3336,6 @@ static IRSB* fd_instrument(VgCallbackClosure* closure, IRSB* sbIn,
 				break;
 		}
 	}
-
     return sbOut;
 }
 
@@ -2419,45 +3397,6 @@ static void getIntroducedError(mpfr_t* introducedError, MeanValue* mv) {
 	} else {
 		mpfr_set(*introducedError, introMaxError, STD_RND);
 	}
-}
-
-static void getFileName(Char* name) {
-	Char tempName[256];
-	struct vg_stat st;
-	int i;
-	for (i = 1; i < 100; ++i) {
-		VG_(sprintf)(tempName, "%s_%d", name, i);
-		SysRes res = VG_(stat)(tempName, &st);
-		if (sr_isError(res)) {
-			break;
-		}
-	}
-	VG_(sprintf)(name, "%s_%d", name, i);
-}
-
-static __inline__
-void fwrite_flush(void) {
-    if ((fwrite_fd>=0) && (fwrite_pos>0)) {
-		VG_(write)(fwrite_fd, (void*)fwrite_buf, fwrite_pos);
-	}
-    fwrite_pos = 0;
-}
-
-static void my_fwrite(Int fd, Char* buf, Int len) {
-    if (fwrite_fd != fd) {
-		fwrite_flush();
-		fwrite_fd = fd;
-    }
-    if (len > FWRITE_THROUGH) {
-		fwrite_flush();
-		VG_(write)(fd, (void*)buf, len);
-		return;
-    }
-    if (FWRITE_BUFSIZE - fwrite_pos <= len) {
-		fwrite_flush();
-	}
-    VG_(strncpy)(fwrite_buf + fwrite_pos, buf, len);
-    fwrite_pos += len;
 }
 
 static void writeOriginGraph(Int file, Addr oldAddr, Addr origin, Int arg, Int level, Int edgeColor, Bool careVisited) {
@@ -2631,7 +3570,7 @@ static void writeOriginGraph(Int file, Addr oldAddr, Addr origin, Int arg, Int l
 }
 
 static Bool dumpGraph(Char* fileName, ULong addr, Bool conditional, Bool careVisited) {
-	if (!clo_computeMeanValue) {
+	/*if (!clo_computeMeanValue) {
 		VG_(umsg)("DUMP GRAPH (%s): Mean error computation has to be active!\n", fileName);
 		return False;
 	}
@@ -2686,13 +3625,13 @@ static Bool dumpGraph(Char* fileName, ULong addr, Bool conditional, Bool careVis
 		VG_(umsg)("DUMP GRAPH (%s): Shadow variable was not found!\n", fileName);
 		VG_(get_and_pp_StackTrace)(VG_(get_running_tid)(), 16);
 		return False;
-	}
+	}*/
+	return False;
 }
 
 static void printError(Char* varName, ULong addr, Bool conditional) {
 	mpfr_t org, diff, rel;
-
-	ShadowValue* svalue = VG_(HT_lookup)(globalMemory, addr);
+	ShadowValue* svalue = VG_(HT_lookup)(globalMemory, addr);;
 	if (svalue) {
 		mpfr_inits(diff, rel, NULL);
 		
@@ -2733,6 +3672,10 @@ static void printError(Char* varName, ULong addr, Bool conditional) {
 		VG_(umsg)("(%s) %s ORIGINAL:         %s\n", typeName, varName, mpfrBuf);
 		mpfrToString(mpfrBuf, &(svalue->value));
 		VG_(umsg)("(%s) %s SHADOW VALUE:     %s\n", typeName, varName, mpfrBuf);
+		mpfrToString(mpfrBuf, &(svalue->midValue));
+		VG_(umsg)("(%s) %s MIDDLE:           %s\n", typeName, varName, mpfrBuf);
+		mpfrToString(mpfrBuf, &(svalue->oriValue));
+		VG_(umsg)("(%s) %s SIMULATE:         %s\n", typeName, varName, mpfrBuf);
 		mpfrToString(mpfrBuf, &diff);
 		VG_(umsg)("(%s) %s ABSOLUTE ERROR:   %s\n", typeName, varName, mpfrBuf);
 		mpfrToString(mpfrBuf, &rel);
@@ -2817,6 +3760,48 @@ static void insertShadow(ULong addrFp) {
 	ShadowValue* svalue = VG_(HT_lookup)(globalMemory, addrFp);
 	if (svalue) {
 		if (svalue->orgType == Ot_FLOAT) {
+			mpfr_set_prec(svalue->midValue, 24);
+			mpfr_set(svalue->midValue, svalue->value, STD_RND);
+
+			// Float* orgFl = (Float*)addrFp;
+			// *orgFl = mpfr_get_flt(svalue->value, STD_RND);
+   //                      unsigned int ul = *(unsigned int*)addrFp;
+   //                      VG_(umsg)("----address-----%X\n", ul);
+   //                      double temp = mpfr_get_d(svalue->value, STD_RND);
+   //                      unsigned int ul2 = *(unsigned int*)(&temp);
+   //                      VG_(umsg)("---mpfr----%X\n", ul2);
+			// unsigned int ul3 = *(unsigned int*)(orgFl);
+			// VG_(umsg)("----orgfl---%X\n", ul3);
+		} else if (svalue->orgType == Ot_DOUBLE) {
+			mpfr_set_prec(svalue->midValue, 53);
+			mpfr_set(svalue->midValue, svalue->value, STD_RND);
+			// mpfr_set(svalue->midValue, svalue->value, STD_RND);
+			// Double* orgDb = (Double*)addrFp;
+			// *orgDb = mpfr_get_d(svalue->value, STD_RND);
+			// unsigned long long ull = *(unsigned long long*)addrFp;
+			// VG_(umsg)("----***-----%lX\n", ull);
+			// double temp = mpfr_get_d(svalue->value, STD_RND);
+			// unsigned long long ull2 = *(unsigned long long*)(&temp);
+			// VG_(umsg)("---second----%lX\n", ull2);
+			//mpfr_out_str(stdout, 10, 50, svalue->value, STD_RND);
+		} else {
+			tl_assert(False);
+		}
+	}
+}
+
+/*********************/
+static void setShadow(ULong addrFp) {
+	ShadowValue* svalue = VG_(HT_lookup)(globalMemory, addrFp);
+	if (svalue) {
+		mpfr_set(svalue->value, svalue->midValue, STD_RND);
+	}
+}
+
+static void shadowToOriginal(ULong addrFp) {
+	ShadowValue* svalue = VG_(HT_lookup)(globalMemory, addrFp);
+	if (svalue) {
+		if (svalue->orgType == Ot_FLOAT) {
 			Float* orgFl = (Float*)addrFp;
 			*orgFl = mpfr_get_flt(svalue->value, STD_RND);
 		} else if (svalue->orgType == Ot_DOUBLE) {
@@ -2827,6 +3812,129 @@ static void insertShadow(ULong addrFp) {
 		}
 	}
 }
+
+static void originalToShadow(ULong addrFp) {
+	ShadowValue* svalue = VG_(HT_lookup)(globalMemory, addrFp);
+	if (svalue) {
+		if (svalue->orgType == Ot_FLOAT) {
+			Float* orgFl = (Float*)addrFp;
+			mpfr_set_flt(svalue->value, *orgFl, STD_RND);
+			mpfr_set_prec(svalue->midValue, 24);
+			mpfr_set_flt(svalue->midValue, *orgFl, STD_RND);
+		} else if (svalue->orgType == Ot_DOUBLE) {
+			Double* orgDb = (Double*)addrFp;
+			mpfr_set_d(svalue->value, *orgDb, STD_RND);
+			mpfr_set_prec(svalue->midValue, 53);
+			mpfr_set_d(svalue->midValue, *orgDb, STD_RND);
+		} else {
+			tl_assert(False);
+		}
+	}
+}
+
+static void setOriginal(ULong addrFp, ULong addrVal) {
+	ShadowValue* svalue = VG_(HT_lookup)(globalMemory, addrFp);
+	if (svalue) {
+		if (svalue->orgType == Ot_FLOAT) {
+			Float* orgFl = (Float*)addrFp;
+			Float* value = (Float*)addrVal;
+			*orgFl = *value;
+			mpfr_set_prec(svalue->midValue, 24);
+			mpfr_set_flt(svalue->midValue, *orgFl, STD_RND);
+		} else if (svalue->orgType == Ot_DOUBLE) {
+			Double* orgDb = (Double*)addrFp;
+			Double* value = (Double*)addrVal;
+			*orgDb = *value;
+			mpfr_set_prec(svalue->midValue, 53);
+			mpfr_set_d(svalue->midValue, *orgDb, STD_RND);
+		} else {
+			tl_assert(False);
+		}
+	}
+}
+
+static void setShadowBy(ULong addrDst, ULong addrSrc) {
+	ShadowValue* dvalue = VG_(HT_lookup)(globalMemory, addrDst);
+	ShadowValue* svalue = VG_(HT_lookup)(globalMemory, addrSrc);
+	if (dvalue && svalue) {
+		mpfr_set(dvalue->value, svalue->value, STD_RND);
+		mpfr_set(dvalue->midValue, svalue->midValue, STD_RND);
+	}
+}
+
+static void getRelativeError(ULong addr, Char* rel_str) {
+	mpfr_t org, diff, rel;
+
+	ShadowValue* svalue = VG_(HT_lookup)(globalMemory, addr);
+	
+	if (svalue) {
+		mpfr_inits(diff, rel, NULL);
+		
+		Bool isFloat = svalue->orgType == Ot_FLOAT;
+		if (svalue->orgType == Ot_FLOAT) {
+			mpfr_init(org);
+			mpfr_set_flt(org, svalue->Org.fl, STD_RND);
+		} else if (svalue->orgType == Ot_DOUBLE) {
+			mpfr_init_set_d(org, svalue->Org.db, STD_RND);
+		} else {
+			tl_assert(False);
+		}
+
+		if (mpfr_cmp_ui(svalue->value, 0) != 0 || mpfr_cmp_ui(org, 0) != 0) {
+			mpfr_reldiff(rel, svalue->value, org, STD_RND);
+			mpfr_abs(rel, rel, STD_RND);
+		} else {
+			mpfr_set_ui(rel, 0, STD_RND);
+		}
+
+		mpfrToStringE(rel_str, &rel);
+		//VG_(umsg)("RELATIVE ERROR: %s\n", rel_str);
+
+		mpfr_clears(org, diff, rel, NULL);
+	} else {
+		VG_(strcpy)(rel_str, "0.0e+0");
+		//VG_(get_and_pp_StackTrace)(VG_(get_running_tid)(), 16);
+	}
+}
+
+static void getShadow(ULong addr, Char* sd) {
+	ShadowValue* svalue = VG_(HT_lookup)(globalMemory, addr);
+	if (svalue) {
+		Char mpfrBuf[MPFR_BUFSIZE];
+		mpfrToStringE(mpfrBuf, &(svalue->value));
+		VG_(strcpy)(sd, mpfrBuf);
+	} else {
+		VG_(strcpy)(sd, "noshadow");
+	}
+}
+
+static void printOriginalAndShadow(Char* varName, Int type, ULong addr) {
+	mpfr_t org;
+	mpfr_init(org);
+	Char mpfrBuf[MPFR_BUFSIZE];
+	if (type == 0) {
+		Float* fl = (Float*)addr;
+		mpfr_set_flt(org, *fl, STD_RND);
+		mpfrToStringE(mpfrBuf, &org);
+		VG_(umsg)("(float) %s ORIGINAL VALUE:		%s\n", varName, mpfrBuf);
+		getShadow(addr, mpfrBuf);
+		VG_(umsg)("(float) %s SHADOW VALUE:		%s\n", varName, mpfrBuf);
+	} else if (type == 1) {
+		Double* db = (Double*)addr;
+		mpfr_set_d(org, *db, STD_RND);
+		mpfrToStringE(mpfrBuf, &org);
+		VG_(umsg)("(double) %s ORIGINAL VALUE:		%s\n", varName, mpfrBuf);
+		getShadow(addr, mpfrBuf);
+		VG_(umsg)("(double) %s SHADOW VALUE:		%s\n", varName, mpfrBuf);
+	} else {
+		VG_(tool_panic)("Unhandled value type\n");
+	}
+	mpfr_clear(org);
+}
+
+/*********************/
+
+
 
 static void beginAnalyzing(void) {
 	clo_analyze = True;
@@ -3196,9 +4304,9 @@ static void endAnalysis(void) {
 	ShadowValue** memory = VG_(HT_to_array)(globalMemory, &n_memory);
 	VG_(ssort)(memory, n_memory, sizeof(VgHashNode*), compareShadowValues);
 
-	writeMemoryRelError(memory, n_memory);
-	writeMemoryCanceled(memory, n_memory);
-	writeMemorySpecial(memory, n_memory);
+	//writeMemoryRelError(memory, n_memory);
+	//writeMemoryCanceled(memory, n_memory);
+	//writeMemorySpecial(memory, n_memory);
 
 	VG_(free)(memory);
 }
@@ -3447,7 +4555,7 @@ static void writeStageReports(Char* fname) {
 static void fd_fini(Int exitcode) {
 	endAnalysis();
 
-	HChar* clientName = VG_(args_the_exename);
+	/*HChar* clientName = VG_(args_the_exename);
 	VG_(sprintf)(filename, "%s_mean_errors_addr", clientName);
 	writeMeanValues(filename, &compareMVAddr, False);
 	if (clo_bad_cancellations) {
@@ -3458,7 +4566,7 @@ static void fd_fini(Int exitcode) {
 	writeMeanValues(filename, &compareMVIntroError, False);
 
 	VG_(sprintf)(filename, "%s_stage_reports", clientName);
-	writeStageReports(filename);
+	writeStageReports(filename);*/
 
 #ifndef NDEBUG
 	VG_(umsg)("DEBUG - Client exited with code: %d\n", exitcode);
@@ -3506,6 +4614,44 @@ static Bool fd_handle_client_request(ThreadId tid, UWord* arg, UWord* ret) {
 		case VG_USERREQ__INSERT_SHADOW:
 			insertShadow(arg[1]);
 			break;
+		/*****************/
+		case VG_USERREQ__SET_SHADOW:
+			setShadow(arg[1]);
+			break;
+		case VG_USERREQ__ORIGINAL_TO_SHADOW:
+			originalToShadow(arg[1]);
+			break;
+		case VG_USERREQ__SHADOW_TO_ORIGINAL:
+			shadowToOriginal(arg[1]);
+			break;
+		case VG_USERREQ__SET_ORIGINAL:
+			setOriginal(arg[1], arg[2]);
+			break;
+		case VG_USERREQ__SET_SHADOW_BY:
+			setShadowBy(arg[1], arg[2]);
+			break;
+	    case VG_USERREQ__GET_RELATIVE_ERROR:
+	    	getRelativeError(arg[1], (Char*)arg[2]);
+	    	break;
+	    case VG_USERREQ__PSO_BEGIN_RUN:
+	    	beginOneRun();
+	    	break;
+	    case VG_USERREQ__PSO_END_RUN:
+	    	endOneRun();
+	    	break;
+	    case VG_USERREQ__PSO_BEGIN_INSTANCE:
+	    	beginOneInstance();
+	    	break;
+	    case VG_USERREQ__IS_PSO_FINISHED:
+	    	*ret = (UWord)isPSOFinished();
+	    	return True;
+	    case VG_USERREQ__GET_SHADOW:
+	    	getShadow(arg[1], (Char*)arg[2]);
+	    	break;
+	    case VG_USERREQ__PRINT_VALUES:
+	    	printOriginalAndShadow((Char*)arg[1], arg[2], arg[3]);
+	    	break;
+		/*****************/
 		case VG_USERREQ__BEGIN:
 			beginAnalyzing();
 			break;
@@ -3536,12 +4682,19 @@ static void fd_post_clo_init(void) {
 	VG_(umsg)("sim-original=%s\n", clo_simulateOriginal ? "yes" : "no");
 	VG_(umsg)("analyze-all=%s\n", clo_analyze ? "yes" : "no");
 	VG_(umsg)("bad-cancellations=%s\n", clo_bad_cancellations ? "yes" : "no");
-    VG_(umsg)("ignore-end=%s\n", clo_ignore_end ? "yes" : "no");	
+    VG_(umsg)("ignore-end=%s\n", clo_ignore_end ? "yes" : "no");
+    VG_(umsg)("error-localization=%s\n", clo_error_localization ? "yes" : "no");
+    VG_(umsg)("print-every-error=%s\n", clo_print_every_error ? "yes" : "no");
+    VG_(umsg)("detect-pso=%s\n", clo_detect_pso ? "yes" : "no");
+    VG_(umsg)("goto-shadow-branch=%s\n", clo_goto_shadow_branch ? "yes" : "no");
 
 	mpfr_set_default_prec(clo_precision);
+	defaultEmin = mpfr_get_emin();
+	defaultEmax = mpfr_get_emax();
 
 	globalMemory = VG_(HT_construct)("Global memory");
 	meanValues = VG_(HT_construct)("Mean values");
+	detectedPSO = VG_(HT_construct)("Detected precision-specific operations");
 
 	storeArgs = VG_(malloc)("fd.init.1", sizeof(Store));
 	muxArgs = VG_(malloc)("fd.init.2", sizeof(Mux0X));
@@ -3560,6 +4713,14 @@ static void fd_post_clo_init(void) {
 	mpfr_inits(writeSvOrg, writeSvDiff, writeSvRelError, NULL);
 	mpfr_init(cancelTemp);
 	mpfr_inits(arg1tmpX, arg2tmpX, arg3tmpX, NULL);
+	mpfr_inits(arg1midX, arg2midX, arg3midX, NULL);
+	mpfr_inits(arg1oriX, arg2oriX, arg3oriX, NULL);
+	mpfr_set_d(arg1midX, 1.0, STD_RND);
+	mpfr_set_d(arg2midX, 1.0, STD_RND);
+	mpfr_set_d(arg3midX, 1.0, STD_RND);
+	mpfr_set_d(arg1oriX, 1.0, STD_RND);
+	mpfr_set_d(arg2oriX, 1.0, STD_RND);
+	mpfr_set_d(arg3oriX, 1.0, STD_RND);
 
 	Int i;
 	for (i = 0; i < TMP_COUNT; i++) {
